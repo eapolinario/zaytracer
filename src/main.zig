@@ -109,34 +109,124 @@ const Ray = struct {
 };
 
 // ============================================================================
-// Sphere Intersection
+// Interval
 // ============================================================================
 
-fn hitSphere(center: Point3, radius: f64, ray: Ray) f64 {
-    const oc = center.sub(ray.origin);
-    const a = ray.direction.lengthSquared();
-    const h = ray.direction.dot(oc);
-    const c = oc.lengthSquared() - radius * radius;
-    const discriminant = h * h - a * c;
+const Interval = struct {
+    min: f64,
+    max: f64,
 
-    if (discriminant < 0) {
-        return -1.0;
-    } else {
-        return (h - @sqrt(discriminant)) / a;
+    pub fn contains(self: Interval, x: f64) bool {
+        return self.min <= x and x <= self.max;
     }
-}
+
+    pub fn surrounds(self: Interval, x: f64) bool {
+        return self.min < x and x < self.max;
+    }
+};
+
+// ============================================================================
+// Hit Record
+// ============================================================================
+
+const HitRecord = struct {
+    point: Point3,
+    normal: Vec3,
+    t: f64,
+    front_face: bool,
+
+    pub fn setFaceNormal(self: *HitRecord, ray: Ray, outward_normal: Vec3) void {
+        self.front_face = ray.direction.dot(outward_normal) < 0;
+        self.normal = if (self.front_face) outward_normal else outward_normal.neg();
+    }
+};
+
+// ============================================================================
+// Hittable - Sphere
+// ============================================================================
+
+const Sphere = struct {
+    center: Point3,
+    radius: f64,
+
+    pub fn init(center: Point3, radius: f64) Sphere {
+        return Sphere{ .center = center, .radius = radius };
+    }
+
+    pub fn hit(self: Sphere, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        const oc = self.center.sub(ray.origin);
+        const a = ray.direction.lengthSquared();
+        const h = ray.direction.dot(oc);
+        const c = oc.lengthSquared() - self.radius * self.radius;
+        const discriminant = h * h - a * c;
+
+        if (discriminant < 0) {
+            return false;
+        }
+
+        const sqrtd = @sqrt(discriminant);
+
+        // Find the nearest root that lies in the acceptable range
+        var root = (h - sqrtd) / a;
+        if (!ray_t.surrounds(root)) {
+            root = (h + sqrtd) / a;
+            if (!ray_t.surrounds(root)) {
+                return false;
+            }
+        }
+
+        rec.t = root;
+        rec.point = ray.at(rec.t);
+        const outward_normal = rec.point.sub(self.center).div(self.radius);
+        rec.setFaceNormal(ray, outward_normal);
+
+        return true;
+    }
+};
+
+// ============================================================================
+// Hittable List
+// ============================================================================
+
+const HittableList = struct {
+    spheres: []const Sphere,
+
+    pub fn init(spheres: []const Sphere) HittableList {
+        return HittableList{ .spheres = spheres };
+    }
+
+    pub fn hit(self: HittableList, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        var temp_rec: HitRecord = undefined;
+        var hit_anything = false;
+        var closest_so_far = ray_t.max;
+
+        for (self.spheres) |sphere| {
+            if (sphere.hit(ray, Interval{ .min = ray_t.min, .max = closest_so_far }, &temp_rec)) {
+                hit_anything = true;
+                closest_so_far = temp_rec.t;
+                rec.* = temp_rec;
+            }
+        }
+
+        return hit_anything;
+    }
+};
 
 // ============================================================================
 // Ray Color (Background)
 // ============================================================================
 
-fn rayColor(ray: Ray) Color {
-    // Check if ray hits sphere at (0, 0, -1) with radius 0.5
-    const sphere_center = Point3{ .x = 0, .y = 0, .z = -1 };
-    const t = hitSphere(sphere_center, 0.5, ray);
-    if (t > 0.0) {
-        // Hit the sphere - color it red
-        return Color{ .x = 1.0, .y = 0.0, .z = 0.0 };
+fn rayColor(ray: Ray, world: HittableList) Color {
+    var rec: HitRecord = undefined;
+
+    if (world.hit(ray, Interval{ .min = 0, .max = std.math.inf(f64) }, &rec)) {
+        // Visualize surface normal by mapping it to RGB
+        // Normal components are in range [-1, 1], map to [0, 1]
+        return Color{
+            .x = 0.5 * (rec.normal.x + 1.0),
+            .y = 0.5 * (rec.normal.y + 1.0),
+            .z = 0.5 * (rec.normal.z + 1.0),
+        };
     }
 
     // Create a gradient background from white to blue
@@ -170,6 +260,13 @@ fn writeColor(file: std.fs.File, color: Color) !void {
 // ============================================================================
 
 pub fn main() !void {
+    // World - create a scene with two spheres
+    const spheres = [_]Sphere{
+        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1 }, 0.5),      // Center sphere
+        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100), // Ground sphere
+    };
+    const world = HittableList.init(&spheres);
+
     // Image dimensions
     const aspect_ratio: f64 = 16.0 / 9.0;
     const image_width: u32 = 400;
@@ -220,7 +317,7 @@ pub fn main() !void {
             const ray_direction = pixel_center.sub(camera_center);
             const ray = Ray.init(camera_center, ray_direction);
 
-            const pixel_color = rayColor(ray);
+            const pixel_color = rayColor(ray, world);
             try writeColor(file, pixel_color);
         }
     }
