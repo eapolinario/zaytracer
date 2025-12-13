@@ -13,9 +13,23 @@ This project implements a complete raytracer from scratch, building up features 
 - Positionable camera with depth of field
 - Final scene with hundreds of spheres
 
-## Building
+## Development Environment
 
-Requires Zig 0.13.0 or later.
+### Using Nix Flakes (Recommended)
+
+If you have Nix with flakes enabled:
+
+```bash
+nix develop
+```
+
+This will provide a shell with Zig and ZLS (Zig Language Server) available.
+
+### Manual Installation
+
+Alternatively, install Zig 0.13.0 or later from [ziglang.org](https://ziglang.org/download/).
+
+## Building
 
 ```bash
 zig build
