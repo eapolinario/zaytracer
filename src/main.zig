@@ -109,10 +109,36 @@ const Ray = struct {
 };
 
 // ============================================================================
+// Sphere Intersection
+// ============================================================================
+
+fn hitSphere(center: Point3, radius: f64, ray: Ray) f64 {
+    const oc = center.sub(ray.origin);
+    const a = ray.direction.lengthSquared();
+    const h = ray.direction.dot(oc);
+    const c = oc.lengthSquared() - radius * radius;
+    const discriminant = h * h - a * c;
+
+    if (discriminant < 0) {
+        return -1.0;
+    } else {
+        return (h - @sqrt(discriminant)) / a;
+    }
+}
+
+// ============================================================================
 // Ray Color (Background)
 // ============================================================================
 
 fn rayColor(ray: Ray) Color {
+    // Check if ray hits sphere at (0, 0, -1) with radius 0.5
+    const sphere_center = Point3{ .x = 0, .y = 0, .z = -1 };
+    const t = hitSphere(sphere_center, 0.5, ray);
+    if (t > 0.0) {
+        // Hit the sphere - color it red
+        return Color{ .x = 1.0, .y = 0.0, .z = 0.0 };
+    }
+
     // Create a gradient background from white to blue
     const unit_direction = ray.direction.unitVector();
     const a = 0.5 * (unit_direction.y + 1.0);
