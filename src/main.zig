@@ -92,6 +92,39 @@ const Point3 = Vec3;
 const Color = Vec3;
 
 // ============================================================================
+// Ray
+// ============================================================================
+
+const Ray = struct {
+    origin: Point3,
+    direction: Vec3,
+
+    pub fn init(origin: Point3, direction: Vec3) Ray {
+        return Ray{ .origin = origin, .direction = direction };
+    }
+
+    pub inline fn at(self: Ray, t: f64) Point3 {
+        return self.origin.add(self.direction.mul(t));
+    }
+};
+
+// ============================================================================
+// Ray Color (Background)
+// ============================================================================
+
+fn rayColor(ray: Ray) Color {
+    // Create a gradient background from white to blue
+    const unit_direction = ray.direction.unitVector();
+    const a = 0.5 * (unit_direction.y + 1.0);
+
+    // Linear interpolation: (1-a)*white + a*blue
+    const white = Color{ .x = 1.0, .y = 1.0, .z = 1.0 };
+    const blue = Color{ .x = 0.5, .y = 0.7, .z = 1.0 };
+
+    return white.mul(1.0 - a).add(blue.mul(a));
+}
+
+// ============================================================================
 // Color Utilities
 // ============================================================================
 
@@ -110,8 +143,31 @@ fn writeColor(writer: anytype, color: Color) !void {
 
 pub fn main() !void {
     // Image dimensions
-    const image_width: u32 = 256;
-    const image_height: u32 = 256;
+    const aspect_ratio: f64 = 16.0 / 9.0;
+    const image_width: u32 = 400;
+    const image_height: u32 = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
+
+    // Camera
+    const focal_length: f64 = 1.0;
+    const viewport_height: f64 = 2.0;
+    const viewport_width: f64 = viewport_height * (@as(f64, @floatFromInt(image_width)) / @as(f64, @floatFromInt(image_height)));
+    const camera_center = Point3{ .x = 0, .y = 0, .z = 0 };
+
+    // Calculate the vectors across the horizontal and down the vertical viewport edges
+    const viewport_u = Vec3{ .x = viewport_width, .y = 0, .z = 0 };
+    const viewport_v = Vec3{ .x = 0, .y = -viewport_height, .z = 0 };
+
+    // Calculate the horizontal and vertical delta vectors from pixel to pixel
+    const pixel_delta_u = viewport_u.div(@floatFromInt(image_width));
+    const pixel_delta_v = viewport_v.div(@floatFromInt(image_height));
+
+    // Calculate the location of the upper left pixel
+    const viewport_upper_left = camera_center
+        .sub(Vec3{ .x = 0, .y = 0, .z = focal_length })
+        .sub(viewport_u.div(2.0))
+        .sub(viewport_v.div(2.0));
+
+    const pixel00_loc = viewport_upper_left.add(pixel_delta_u.add(pixel_delta_v).mul(0.5));
 
     // Create output file
     const file = try std.fs.cwd().createFile("image.ppm", .{});
@@ -122,20 +178,21 @@ pub fn main() !void {
     // Write PPM header
     try writer.print("P3\n{d} {d}\n255\n", .{ image_width, image_height });
 
-    // Write pixel data
+    // Render
     var j: u32 = 0;
     while (j < image_height) : (j += 1) {
-        // Progress indicator
         std.debug.print("\rScanlines remaining: {d} ", .{image_height - j});
 
         var i: u32 = 0;
         while (i < image_width) : (i += 1) {
-            // Calculate RGB values (0.0 to 1.0)
-            const r = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(image_width - 1));
-            const g = @as(f64, @floatFromInt(j)) / @as(f64, @floatFromInt(image_height - 1));
-            const b = 0.0;
+            const pixel_center = pixel00_loc
+                .add(pixel_delta_u.mul(@floatFromInt(i)))
+                .add(pixel_delta_v.mul(@floatFromInt(j)));
 
-            const pixel_color = Color{ .x = r, .y = g, .z = b };
+            const ray_direction = pixel_center.sub(camera_center);
+            const ray = Ray.init(camera_center, ray_direction);
+
+            const pixel_color = rayColor(ray);
             try writeColor(writer, pixel_color);
         }
     }
