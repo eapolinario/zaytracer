@@ -4,11 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "zaytracer",
+    const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "zaytracer",
+        .root_module = exe_module,
     });
 
     b.installArtifact(exe);
@@ -23,10 +27,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the raytracer");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_unit_tests = b.addTest(.{
+    const test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const exe_unit_tests = b.addTest(.{
+        .name = "zaytracer-test",
+        .root_module = test_module,
     });
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);

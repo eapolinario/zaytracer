@@ -1,6 +1,10 @@
 # Zig build artifacts
 zig-cache/
 zig-out/
+.zig-cache/
+
+# Nix/direnv
+.direnv/
 
 # Generated images
 *.ppm

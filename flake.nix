@@ -2,6 +2,7 @@
   description = "Zaytracer - Ray Tracing in One Weekend (Zig implementation)";
 
   inputs = {
+    # Use latest nixpkgs with Zig 0.15.x
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };

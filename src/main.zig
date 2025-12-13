@@ -128,13 +128,15 @@ fn rayColor(ray: Ray) Color {
 // Color Utilities
 // ============================================================================
 
-fn writeColor(writer: anytype, color: Color) !void {
+fn writeColor(file: std.fs.File, color: Color) !void {
     // Convert to 0-255 range
     const ir = @as(u8, @intFromFloat(255.999 * color.x));
     const ig = @as(u8, @intFromFloat(255.999 * color.y));
     const ib = @as(u8, @intFromFloat(255.999 * color.z));
 
-    try writer.print("{d} {d} {d}\n", .{ ir, ig, ib });
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ ir, ig, ib });
+    _ = try file.writeAll(line);
 }
 
 // ============================================================================
@@ -173,10 +175,10 @@ pub fn main() !void {
     const file = try std.fs.cwd().createFile("image.ppm", .{});
     defer file.close();
 
-    const writer = file.writer();
-
     // Write PPM header
-    try writer.print("P3\n{d} {d}\n255\n", .{ image_width, image_height });
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ image_width, image_height });
+    _ = try file.writeAll(header);
 
     // Render
     var j: u32 = 0;
@@ -193,7 +195,7 @@ pub fn main() !void {
             const ray = Ray.init(camera_center, ray_direction);
 
             const pixel_color = rayColor(ray);
-            try writeColor(writer, pixel_color);
+            try writeColor(file, pixel_color);
         }
     }
 
