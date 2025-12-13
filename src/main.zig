@@ -1,6 +1,18 @@
 const std = @import("std");
 
 // ============================================================================
+// Random Utilities
+// ============================================================================
+
+fn randomFloat(rng: std.Random) f64 {
+    return rng.float(f64);
+}
+
+fn randomFloatRange(rng: std.Random, min: f64, max: f64) f64 {
+    return min + (max - min) * randomFloat(rng);
+}
+
+// ============================================================================
 // Vec3 - 3D Vector/Point/Color
 // ============================================================================
 
@@ -244,11 +256,21 @@ fn rayColor(ray: Ray, world: HittableList) Color {
 // Color Utilities
 // ============================================================================
 
-fn writeColor(file: std.fs.File, color: Color) !void {
+fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
+    var r = color.x;
+    var g = color.y;
+    var b = color.z;
+
+    // Divide the color by the number of samples
+    const scale = 1.0 / @as(f64, @floatFromInt(samples_per_pixel));
+    r *= scale;
+    g *= scale;
+    b *= scale;
+
     // Convert to 0-255 range
-    const ir = @as(u8, @intFromFloat(255.999 * color.x));
-    const ig = @as(u8, @intFromFloat(255.999 * color.y));
-    const ib = @as(u8, @intFromFloat(255.999 * color.z));
+    const ir = @as(u8, @intFromFloat(256.0 * std.math.clamp(r, 0.0, 0.999)));
+    const ig = @as(u8, @intFromFloat(256.0 * std.math.clamp(g, 0.0, 0.999)));
+    const ib = @as(u8, @intFromFloat(256.0 * std.math.clamp(b, 0.0, 0.999)));
 
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ ir, ig, ib });
@@ -271,6 +293,11 @@ pub fn main() !void {
     const aspect_ratio: f64 = 16.0 / 9.0;
     const image_width: u32 = 400;
     const image_height: u32 = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
+    const samples_per_pixel: u32 = 100;
+
+    // Random number generator
+    var prng = std.Random.DefaultPrng.init(42);
+    const rng = prng.random();
 
     // Camera
     const focal_length: f64 = 1.0;
@@ -310,15 +337,25 @@ pub fn main() !void {
 
         var i: u32 = 0;
         while (i < image_width) : (i += 1) {
-            const pixel_center = pixel00_loc
-                .add(pixel_delta_u.mul(@floatFromInt(i)))
-                .add(pixel_delta_v.mul(@floatFromInt(j)));
+            var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
 
-            const ray_direction = pixel_center.sub(camera_center);
-            const ray = Ray.init(camera_center, ray_direction);
+            // Take multiple samples per pixel
+            var sample: u32 = 0;
+            while (sample < samples_per_pixel) : (sample += 1) {
+                const offset_u = randomFloat(rng) - 0.5;
+                const offset_v = randomFloat(rng) - 0.5;
 
-            const pixel_color = rayColor(ray, world);
-            try writeColor(file, pixel_color);
+                const pixel_sample = pixel00_loc
+                    .add(pixel_delta_u.mul(@as(f64, @floatFromInt(i)) + offset_u))
+                    .add(pixel_delta_v.mul(@as(f64, @floatFromInt(j)) + offset_v));
+
+                const ray_direction = pixel_sample.sub(camera_center);
+                const ray = Ray.init(camera_center, ray_direction);
+
+                pixel_color = pixel_color.add(rayColor(ray, world));
+            }
+
+            try writeColor(file, pixel_color, samples_per_pixel);
         }
     }
 
