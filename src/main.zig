@@ -12,6 +12,35 @@ fn randomFloatRange(rng: std.Random, min: f64, max: f64) f64 {
     return min + (max - min) * randomFloat(rng);
 }
 
+fn randomVec3(rng: std.Random) Vec3 {
+    return Vec3{
+        .x = randomFloat(rng),
+        .y = randomFloat(rng),
+        .z = randomFloat(rng),
+    };
+}
+
+fn randomVec3Range(rng: std.Random, min: f64, max: f64) Vec3 {
+    return Vec3{
+        .x = randomFloatRange(rng, min, max),
+        .y = randomFloatRange(rng, min, max),
+        .z = randomFloatRange(rng, min, max),
+    };
+}
+
+fn randomInUnitSphere(rng: std.Random) Vec3 {
+    while (true) {
+        const p = randomVec3Range(rng, -1.0, 1.0);
+        if (p.lengthSquared() < 1.0) {
+            return p;
+        }
+    }
+}
+
+fn randomUnitVector(rng: std.Random) Vec3 {
+    return randomInUnitSphere(rng).unitVector();
+}
+
 // ============================================================================
 // Vec3 - 3D Vector/Point/Color
 // ============================================================================
@@ -228,17 +257,19 @@ const HittableList = struct {
 // Ray Color (Background)
 // ============================================================================
 
-fn rayColor(ray: Ray, world: HittableList) Color {
+fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
+    // If we've exceeded the ray bounce limit, no more light is gathered
+    if (depth <= 0) {
+        return Color{ .x = 0, .y = 0, .z = 0 };
+    }
+
     var rec: HitRecord = undefined;
 
-    if (world.hit(ray, Interval{ .min = 0, .max = std.math.inf(f64) }, &rec)) {
-        // Visualize surface normal by mapping it to RGB
-        // Normal components are in range [-1, 1], map to [0, 1]
-        return Color{
-            .x = 0.5 * (rec.normal.x + 1.0),
-            .y = 0.5 * (rec.normal.y + 1.0),
-            .z = 0.5 * (rec.normal.z + 1.0),
-        };
+    if (world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
+        // Diffuse (Lambertian) reflection
+        const direction = rec.normal.add(randomUnitVector(rng));
+        const scattered = Ray.init(rec.point, direction);
+        return rayColor(scattered, world, depth - 1, rng).mul(0.5);
     }
 
     // Create a gradient background from white to blue
@@ -267,6 +298,11 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
     g *= scale;
     b *= scale;
 
+    // Apply gamma correction (gamma=2.0, so sqrt)
+    r = @sqrt(r);
+    g = @sqrt(g);
+    b = @sqrt(b);
+
     // Convert to 0-255 range
     const ir = @as(u8, @intFromFloat(256.0 * std.math.clamp(r, 0.0, 0.999)));
     const ig = @as(u8, @intFromFloat(256.0 * std.math.clamp(g, 0.0, 0.999)));
@@ -294,6 +330,7 @@ pub fn main() !void {
     const image_width: u32 = 400;
     const image_height: u32 = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
     const samples_per_pixel: u32 = 100;
+    const max_depth: i32 = 50;
 
     // Random number generator
     var prng = std.Random.DefaultPrng.init(42);
@@ -352,7 +389,7 @@ pub fn main() !void {
                 const ray_direction = pixel_sample.sub(camera_center);
                 const ray = Ray.init(camera_center, ray_direction);
 
-                pixel_color = pixel_color.add(rayColor(ray, world));
+                pixel_color = pixel_color.add(rayColor(ray, world, max_depth, rng));
             }
 
             try writeColor(file, pixel_color, samples_per_pixel);
