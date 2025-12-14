@@ -140,6 +140,20 @@ fn reflect(v: Vec3, n: Vec3) Vec3 {
     return v.sub(n.mul(2.0 * v.dot(n)));
 }
 
+fn refract(uv: Vec3, n: Vec3, etai_over_etat: f64) Vec3 {
+    const cos_theta = @min(uv.neg().dot(n), 1.0);
+    const r_out_perp = uv.add(n.mul(cos_theta)).mul(etai_over_etat);
+    const r_out_parallel = n.mul(-@sqrt(@abs(1.0 - r_out_perp.lengthSquared())));
+    return r_out_perp.add(r_out_parallel);
+}
+
+fn reflectance(cosine: f64, refraction_index: f64) f64 {
+    // Use Schlick's approximation for reflectance
+    var r0 = (1.0 - refraction_index) / (1.0 + refraction_index);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * std.math.pow(f64, 1.0 - cosine, 5);
+}
+
 // ============================================================================
 // Material
 // ============================================================================
@@ -147,18 +161,21 @@ fn reflect(v: Vec3, n: Vec3) Vec3 {
 const MaterialType = enum {
     lambertian,
     metal,
+    dielectric,
 };
 
 const Material = struct {
     material_type: MaterialType,
     albedo: Color,
     fuzz: f64, // Only used for metal
+    refraction_index: f64, // Only used for dielectric
 
     pub fn lambertian(albedo: Color) Material {
         return Material{
             .material_type = .lambertian,
             .albedo = albedo,
             .fuzz = 0.0,
+            .refraction_index = 0.0,
         };
     }
 
@@ -167,6 +184,16 @@ const Material = struct {
             .material_type = .metal,
             .albedo = albedo,
             .fuzz = if (fuzz < 1.0) fuzz else 1.0,
+            .refraction_index = 0.0,
+        };
+    }
+
+    pub fn dielectric(refraction_index: f64) Material {
+        return Material{
+            .material_type = .dielectric,
+            .albedo = Color{ .x = 1.0, .y = 1.0, .z = 1.0 },
+            .fuzz = 0.0,
+            .refraction_index = refraction_index,
         };
     }
 
@@ -189,6 +216,23 @@ const Material = struct {
                 scattered.* = Ray.init(rec.point, reflected.add(randomInUnitSphere(rng).mul(self.fuzz)));
                 attenuation.* = self.albedo;
                 return scattered.direction.dot(rec.normal) > 0;
+            },
+            .dielectric => {
+                attenuation.* = Color{ .x = 1.0, .y = 1.0, .z = 1.0 };
+                const ri = if (rec.front_face) (1.0 / self.refraction_index) else self.refraction_index;
+
+                const unit_direction = ray_in.direction.unitVector();
+                const cos_theta = @min(unit_direction.neg().dot(rec.normal), 1.0);
+                const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
+
+                const cannot_refract = ri * sin_theta > 1.0;
+                const direction = if (cannot_refract or reflectance(cos_theta, ri) > randomFloat(rng))
+                    reflect(unit_direction, rec.normal)
+                else
+                    refract(unit_direction, rec.normal, ri);
+
+                scattered.* = Ray.init(rec.point, direction);
+                return true;
             },
         }
     }
@@ -389,14 +433,16 @@ pub fn main() !void {
     // World - create a scene with different materials
     const material_ground = Material.lambertian(Color{ .x = 0.8, .y = 0.8, .z = 0.0 });
     const material_center = Material.lambertian(Color{ .x = 0.1, .y = 0.2, .z = 0.5 });
-    const material_left = Material.metal(Color{ .x = 0.8, .y = 0.8, .z = 0.8 }, 0.3);
-    const material_right = Material.metal(Color{ .x = 0.8, .y = 0.6, .z = 0.2 }, 1.0);
+    const material_left = Material.dielectric(1.5);
+    const material_left_inner = Material.dielectric(1.5);
+    const material_right = Material.metal(Color{ .x = 0.8, .y = 0.6, .z = 0.2 }, 0.0);
 
     const spheres = [_]Sphere{
-        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100, material_ground), // Ground
-        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1.2 }, 0.5, material_center),     // Center
-        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, 0.5, material_left),      // Left
-        Sphere.init(Point3{ .x = 1.0, .y = 0, .z = -1 }, 0.5, material_right),      // Right
+        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100, material_ground),    // Ground
+        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1.2 }, 0.5, material_center),        // Center
+        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, 0.5, material_left),         // Left (glass)
+        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, -0.4, material_left_inner), // Left inner (hollow glass)
+        Sphere.init(Point3{ .x = 1.0, .y = 0, .z = -1 }, 0.5, material_right),         // Right (metal)
     };
     const world = HittableList.init(&spheres);
 
