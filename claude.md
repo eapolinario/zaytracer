@@ -477,12 +477,12 @@ fn randomInUnitDisk(rng: std.rand.Random) Vec3 {
 - [x] Chapter 1: Output an Image
 - [x] Chapter 2: Vec3 Class
 - [x] Chapter 3: Rays, Camera, and Background
-- [ ] Chapter 4: Adding a Sphere
-- [ ] Chapter 5: Surface Normals and Multiple Objects
-- [ ] Chapter 6: Antialiasing
-- [ ] Chapter 7: Diffuse Materials
-- [ ] Chapter 8: Metal Materials
-- [ ] Chapter 9: Dielectrics (Glass)
-- [ ] Chapter 10: Positionable Camera
-- [ ] Chapter 11: Defocus Blur (Depth of Field)
-- [ ] Chapter 12: Final Scene
+- [x] Chapter 4: Adding a Sphere
+- [x] Chapter 5: Surface Normals and Multiple Objects
+- [x] Chapter 6: Antialiasing
+- [x] Chapter 7: Diffuse Materials
+- [x] Chapter 8: Metal Materials
+- [x] Chapter 9: Dielectrics (Glass)
+- [x] Chapter 10: Positionable Camera
+- [x] Chapter 11: Defocus Blur (Depth of Field)
+- [x] Chapter 12: Final Scene
