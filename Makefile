@@ -1,4 +1,5 @@
-.PHONY: help build build-debug build-release run run-debug run-release \
+.PHONY: help build build-debug build-release build-single build-single-release \
+        run run-debug run-release run-single run-single-release \
         run-both bench bench-debug bench-release bench-both clean test view view-debug view-release
 
 # Default target
@@ -7,19 +8,26 @@
 # Default build mode (can be overridden: make build MODE=release)
 MODE ?= debug
 
+# Multithreading flag (can be overridden: make build MULTITHREAD=false)
+MULTITHREAD ?= true
+
 # Help message
 help:
 	@echo "Zaytracer - Available targets:"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  make build              - Build in default mode (Debug)"
+	@echo "  make build              - Build in default mode (Debug, multithreaded)"
 	@echo "  make build-debug        - Build in Debug mode (with safety checks)"
 	@echo "  make build-release      - Build in ReleaseFast mode (optimized)"
+	@echo "  make build-single       - Build Debug mode, single-threaded"
+	@echo "  make build-single-release - Build ReleaseFast mode, single-threaded"
 	@echo ""
 	@echo "Run targets:"
 	@echo "  make run                - Build and run in default mode"
 	@echo "  make run-debug          - Build and run in Debug mode"
 	@echo "  make run-release        - Build and run in ReleaseFast mode"
+	@echo "  make run-single         - Build and run Debug mode, single-threaded"
+	@echo "  make run-single-release - Build and run ReleaseFast, single-threaded"
 	@echo "  make run-both           - Run both modes and save separate images"
 	@echo ""
 	@echo "Benchmark targets:"
@@ -39,17 +47,29 @@ help:
 	@echo "Build modes:"
 	@echo "  Debug       - Safety checks enabled, no optimizations (slower, safer)"
 	@echo "  ReleaseFast - Full optimizations, no safety checks (faster, production)"
+	@echo ""
+	@echo "Build options:"
+	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
+	@echo "  Example: make build MULTITHREAD=false"
 
 # Build targets
 build: build-debug
 
 build-debug:
-	@echo "Building in Debug mode..."
-	zig build
+	@echo "Building in Debug mode (multithreaded=$(MULTITHREAD))..."
+	zig build -Dmultithreading=$(MULTITHREAD)
 
 build-release:
-	@echo "Building in ReleaseFast mode..."
-	zig build -Doptimize=ReleaseFast
+	@echo "Building in ReleaseFast mode (multithreaded=$(MULTITHREAD))..."
+	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD)
+
+build-single:
+	@echo "Building in Debug mode (single-threaded)..."
+	zig build -Dmultithreading=false
+
+build-single-release:
+	@echo "Building in ReleaseFast mode (single-threaded)..."
+	zig build -Doptimize=ReleaseFast -Dmultithreading=false
 
 # Run targets
 run: run-debug
@@ -60,6 +80,14 @@ run-debug: build-debug
 
 run-release: build-release
 	@echo "Running ReleaseFast build..."
+	./zig-out/bin/zaytracer
+
+run-single: build-single
+	@echo "Running Debug build (single-threaded)..."
+	./zig-out/bin/zaytracer
+
+run-single-release: build-single-release
+	@echo "Running ReleaseFast build (single-threaded)..."
 	./zig-out/bin/zaytracer
 
 run-both: build-debug build-release

@@ -4,11 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Build option for multithreading (default: true)
+    const multithreading = b.option(bool, "multithreading", "Enable multithreaded rendering (default: true)") orelse true;
+
+    const options = b.addOptions();
+    options.addOption(bool, "use_multithreading", multithreading);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    exe_module.addImport("build_options", options.createModule());
 
     const exe = b.addExecutable(.{
         .name = "zaytracer",
@@ -32,6 +40,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    test_module.addImport("build_options", options.createModule());
 
     const exe_unit_tests = b.addTest(.{
         .name = "zaytracer-test",

@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 
 // ============================================================================
 // Math Utilities
@@ -755,8 +756,8 @@ pub fn main() !void {
     const samples_per_pixel: u32 = 100; // Use 500 for final quality
     const max_depth: i32 = 50;
 
-    // Configuration
-    const use_multithreading = true; // Toggle between single/multi-threaded (compile-time constant)
+    // Configuration (build-time constants from build.zig)
+    const use_multithreading = build_options.use_multithreading; // Set via -Dmultithreading=true/false
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
