@@ -22,150 +22,134 @@ fn randomFloatRange(rng: std.Random, min: f64, max: f64) f64 {
 
 fn randomVec3(rng: std.Random) Vec3 {
     return Vec3{
-        .x = randomFloat(rng),
-        .y = randomFloat(rng),
-        .z = randomFloat(rng),
+        randomFloat(rng),
+        randomFloat(rng),
+        randomFloat(rng),
     };
 }
 
 fn randomVec3Range(rng: std.Random, min: f64, max: f64) Vec3 {
     return Vec3{
-        .x = randomFloatRange(rng, min, max),
-        .y = randomFloatRange(rng, min, max),
-        .z = randomFloatRange(rng, min, max),
+        randomFloatRange(rng, min, max),
+        randomFloatRange(rng, min, max),
+        randomFloatRange(rng, min, max),
     };
 }
 
 fn randomInUnitSphere(rng: std.Random) Vec3 {
     while (true) {
         const p = randomVec3Range(rng, -1.0, 1.0);
-        if (p.lengthSquared() < 1.0) {
+        if (lengthSquared(p) < 1.0) {
             return p;
         }
     }
 }
 
 fn randomUnitVector(rng: std.Random) Vec3 {
-    return randomInUnitSphere(rng).unitVector();
+    return unitVector(randomInUnitSphere(rng));
 }
 
 fn randomInUnitDisk(rng: std.Random) Vec3 {
     while (true) {
         const p = Vec3{
-            .x = randomFloatRange(rng, -1.0, 1.0),
-            .y = randomFloatRange(rng, -1.0, 1.0),
-            .z = 0.0,
+            randomFloatRange(rng, -1.0, 1.0),
+            randomFloatRange(rng, -1.0, 1.0),
+            0.0,
         };
-        if (p.lengthSquared() < 1.0) {
+        if (lengthSquared(p) < 1.0) {
             return p;
         }
     }
 }
 
 // ============================================================================
-// Vec3 - 3D Vector/Point/Color
+// Vec3 - 3D Vector/Point/Color (SIMD-optimized)
 // ============================================================================
 
-const Vec3 = struct {
-    x: f64,
-    y: f64,
-    z: f64,
-
-    pub fn init(x: f64, y: f64, z: f64) Vec3 {
-        return Vec3{ .x = x, .y = y, .z = z };
-    }
-
-    pub inline fn add(self: Vec3, other: Vec3) Vec3 {
-        return Vec3{
-            .x = self.x + other.x,
-            .y = self.y + other.y,
-            .z = self.z + other.z,
-        };
-    }
-
-    pub inline fn sub(self: Vec3, other: Vec3) Vec3 {
-        return Vec3{
-            .x = self.x - other.x,
-            .y = self.y - other.y,
-            .z = self.z - other.z,
-        };
-    }
-
-    pub inline fn mul(self: Vec3, scalar: f64) Vec3 {
-        return Vec3{
-            .x = self.x * scalar,
-            .y = self.y * scalar,
-            .z = self.z * scalar,
-        };
-    }
-
-    pub inline fn mulVec(self: Vec3, other: Vec3) Vec3 {
-        return Vec3{
-            .x = self.x * other.x,
-            .y = self.y * other.y,
-            .z = self.z * other.z,
-        };
-    }
-
-    pub inline fn div(self: Vec3, scalar: f64) Vec3 {
-        return self.mul(1.0 / scalar);
-    }
-
-    pub inline fn dot(self: Vec3, other: Vec3) f64 {
-        return self.x * other.x + self.y * other.y + self.z * other.z;
-    }
-
-    pub inline fn cross(self: Vec3, other: Vec3) Vec3 {
-        return Vec3{
-            .x = self.y * other.z - self.z * other.y,
-            .y = self.z * other.x - self.x * other.z,
-            .z = self.x * other.y - self.y * other.x,
-        };
-    }
-
-    pub inline fn lengthSquared(self: Vec3) f64 {
-        return self.x * self.x + self.y * self.y + self.z * self.z;
-    }
-
-    pub inline fn length(self: Vec3) f64 {
-        return @sqrt(self.lengthSquared());
-    }
-
-    pub inline fn unitVector(self: Vec3) Vec3 {
-        return self.div(self.length());
-    }
-
-    pub inline fn neg(self: Vec3) Vec3 {
-        return Vec3{
-            .x = -self.x,
-            .y = -self.y,
-            .z = -self.z,
-        };
-    }
-
-    pub inline fn nearZero(self: Vec3) bool {
-        const s = 1e-8;
-        return (@abs(self.x) < s) and (@abs(self.y) < s) and (@abs(self.z) < s);
-    }
-};
+// SIMD vector type - uses hardware vector instructions (AVX/SSE/NEON)
+const Vec3 = @Vector(3, f64);
 
 // Type aliases for semantic clarity
 const Point3 = Vec3;
 const Color = Vec3;
+
+// Helper for construction
+pub inline fn vec3(x: f64, y: f64, z: f64) Vec3 {
+    return Vec3{ x, y, z };
+}
+
+// Arithmetic operations (leverage SIMD operators)
+pub inline fn add(a: Vec3, b: Vec3) Vec3 {
+    return a + b;
+}
+
+pub inline fn sub(a: Vec3, b: Vec3) Vec3 {
+    return a - b;
+}
+
+pub inline fn mul(v: Vec3, s: f64) Vec3 {
+    return v * @as(Vec3, @splat(s));
+}
+
+pub inline fn mulVec(a: Vec3, b: Vec3) Vec3 {
+    return a * b;
+}
+
+pub inline fn div(v: Vec3, s: f64) Vec3 {
+    return v / @as(Vec3, @splat(s));
+}
+
+pub inline fn neg(v: Vec3) Vec3 {
+    return -v;
+}
+
+// Reduction operations
+pub inline fn dot(a: Vec3, b: Vec3) f64 {
+    return @reduce(.Add, a * b);
+}
+
+pub inline fn lengthSquared(v: Vec3) f64 {
+    return dot(v, v);
+}
+
+pub inline fn length(v: Vec3) f64 {
+    return @sqrt(lengthSquared(v));
+}
+
+pub inline fn unitVector(v: Vec3) Vec3 {
+    return div(v, length(v));
+}
+
+// Cross product (requires shuffling)
+pub inline fn cross(a: Vec3, b: Vec3) Vec3 {
+    const a_yzx = @shuffle(f64, a, undefined, [3]i32{ 1, 2, 0 });
+    const a_zxy = @shuffle(f64, a, undefined, [3]i32{ 2, 0, 1 });
+    const b_yzx = @shuffle(f64, b, undefined, [3]i32{ 1, 2, 0 });
+    const b_zxy = @shuffle(f64, b, undefined, [3]i32{ 2, 0, 1 });
+    return a_yzx * b_zxy - a_zxy * b_yzx;
+}
+
+// Comparison
+pub inline fn nearZero(v: Vec3) bool {
+    const s = @as(Vec3, @splat(1e-8));
+    const abs_v = @abs(v);
+    const cmp = abs_v < s;
+    return @reduce(.And, cmp);
+}
 
 // ============================================================================
 // Vector Utilities
 // ============================================================================
 
 fn reflect(v: Vec3, n: Vec3) Vec3 {
-    return v.sub(n.mul(2.0 * v.dot(n)));
+    return sub(v, mul(n, 2.0 * dot(v, n)));
 }
 
 fn refract(uv: Vec3, n: Vec3, etai_over_etat: f64) Vec3 {
-    const cos_theta = @min(uv.neg().dot(n), 1.0);
-    const r_out_perp = uv.add(n.mul(cos_theta)).mul(etai_over_etat);
-    const r_out_parallel = n.mul(-@sqrt(@abs(1.0 - r_out_perp.lengthSquared())));
-    return r_out_perp.add(r_out_parallel);
+    const cos_theta = @min(dot(neg(uv), n), 1.0);
+    const r_out_perp = mul(add(uv, mul(n, cos_theta)), etai_over_etat);
+    const r_out_parallel = mul(n, -@sqrt(@abs(1.0 - lengthSquared(r_out_perp))));
+    return add(r_out_perp, r_out_parallel);
 }
 
 fn reflectance(cosine: f64, refraction_index: f64) f64 {
@@ -212,7 +196,7 @@ const Material = struct {
     pub fn dielectric(refraction_index: f64) Material {
         return Material{
             .material_type = .dielectric,
-            .albedo = Color{ .x = 1.0, .y = 1.0, .z = 1.0 },
+            .albedo = Color{ 1.0, 1.0, 1.0 },
             .fuzz = 0.0,
             .refraction_index = refraction_index,
         };
@@ -221,10 +205,10 @@ const Material = struct {
     pub fn scatter(self: Material, ray_in: Ray, rec: HitRecord, attenuation: *Color, scattered: *Ray, rng: std.Random) bool {
         switch (self.material_type) {
             .lambertian => {
-                var scatter_direction = rec.normal.add(randomUnitVector(rng));
+                var scatter_direction = add(rec.normal, randomUnitVector(rng));
 
                 // Catch degenerate scatter direction
-                if (scatter_direction.nearZero()) {
+                if (nearZero(scatter_direction)) {
                     scatter_direction = rec.normal;
                 }
 
@@ -233,17 +217,17 @@ const Material = struct {
                 return true;
             },
             .metal => {
-                const reflected = reflect(ray_in.direction.unitVector(), rec.normal);
-                scattered.* = Ray.init(rec.point, reflected.add(randomInUnitSphere(rng).mul(self.fuzz)));
+                const reflected = reflect(unitVector(ray_in.direction), rec.normal);
+                scattered.* = Ray.init(rec.point, add(reflected, mul(randomInUnitSphere(rng), self.fuzz)));
                 attenuation.* = self.albedo;
-                return scattered.direction.dot(rec.normal) > 0;
+                return dot(scattered.direction, rec.normal) > 0;
             },
             .dielectric => {
-                attenuation.* = Color{ .x = 1.0, .y = 1.0, .z = 1.0 };
+                attenuation.* = Color{ 1.0, 1.0, 1.0 };
                 const ri = if (rec.front_face) (1.0 / self.refraction_index) else self.refraction_index;
 
-                const unit_direction = ray_in.direction.unitVector();
-                const cos_theta = @min(unit_direction.neg().dot(rec.normal), 1.0);
+                const unit_direction = unitVector(ray_in.direction);
+                const cos_theta = @min(dot(neg(unit_direction), rec.normal), 1.0);
                 const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
 
                 const cannot_refract = ri * sin_theta > 1.0;
@@ -272,7 +256,7 @@ const Ray = struct {
     }
 
     pub inline fn at(self: Ray, t: f64) Point3 {
-        return self.origin.add(self.direction.mul(t));
+        return add(self.origin, mul(self.direction, t));
     }
 };
 
@@ -305,8 +289,8 @@ const HitRecord = struct {
     front_face: bool,
 
     pub fn setFaceNormal(self: *HitRecord, ray: Ray, outward_normal: Vec3) void {
-        self.front_face = ray.direction.dot(outward_normal) < 0;
-        self.normal = if (self.front_face) outward_normal else outward_normal.neg();
+        self.front_face = dot(ray.direction, outward_normal) < 0;
+        self.normal = if (self.front_face) outward_normal else neg(outward_normal);
     }
 };
 
@@ -324,10 +308,10 @@ const Sphere = struct {
     }
 
     pub fn hit(self: Sphere, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
-        const oc = self.center.sub(ray.origin);
-        const a = ray.direction.lengthSquared();
-        const h = ray.direction.dot(oc);
-        const c = oc.lengthSquared() - self.radius * self.radius;
+        const oc = sub(self.center, ray.origin);
+        const a = lengthSquared(ray.direction);
+        const h = dot(ray.direction, oc);
+        const c = lengthSquared(oc) - self.radius * self.radius;
         const discriminant = h * h - a * c;
 
         if (discriminant < 0) {
@@ -348,7 +332,7 @@ const Sphere = struct {
         rec.t = root;
         rec.point = ray.at(rec.t);
         rec.material = self.material;
-        const outward_normal = rec.point.sub(self.center).div(self.radius);
+        const outward_normal = div(sub(rec.point, self.center), self.radius);
         rec.setFaceNormal(ray, outward_normal);
 
         return true;
@@ -390,7 +374,7 @@ const HittableList = struct {
 fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
-        return Color{ .x = 0, .y = 0, .z = 0 };
+        return Color{ 0, 0, 0 };
     }
 
     var rec: HitRecord = undefined;
@@ -400,20 +384,20 @@ fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
         var attenuation: Color = undefined;
 
         if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
-            return attenuation.mulVec(rayColor(scattered, world, depth - 1, rng));
+            return mulVec(attenuation, rayColor(scattered, world, depth - 1, rng));
         }
-        return Color{ .x = 0, .y = 0, .z = 0 };
+        return Color{ 0, 0, 0 };
     }
 
     // Create a gradient background from white to blue
-    const unit_direction = ray.direction.unitVector();
-    const a = 0.5 * (unit_direction.y + 1.0);
+    const unit_direction = unitVector(ray.direction);
+    const a = 0.5 * (unit_direction[1] + 1.0);
 
     // Linear interpolation: (1-a)*white + a*blue
-    const white = Color{ .x = 1.0, .y = 1.0, .z = 1.0 };
-    const blue = Color{ .x = 0.5, .y = 0.7, .z = 1.0 };
+    const white = Color{ 1.0, 1.0, 1.0 };
+    const blue = Color{ 0.5, 0.7, 1.0 };
 
-    return white.mul(1.0 - a).add(blue.mul(a));
+    return add(mul(white, 1.0 - a), mul(blue, a));
 }
 
 // ============================================================================
@@ -449,32 +433,29 @@ const Camera = struct {
         const viewport_width = viewport_height * (@as(f64, @floatFromInt(image_width)) / @as(f64, @floatFromInt(image_height)));
 
         // Calculate camera basis vectors
-        const w = lookfrom.sub(lookat).unitVector();
-        const u = vup.cross(w).unitVector();
-        const v = w.cross(u);
+        const w = unitVector(sub(lookfrom, lookat));
+        const u = unitVector(cross(vup, w));
+        const v = cross(w, u);
 
         const center = lookfrom;
 
         // Calculate the vectors across the horizontal and down the vertical viewport edges
-        const viewport_u = u.mul(viewport_width);
-        const viewport_v = v.neg().mul(viewport_height);
+        const viewport_u = mul(u, viewport_width);
+        const viewport_v = mul(neg(v), viewport_height);
 
         // Calculate the horizontal and vertical delta vectors from pixel to pixel
-        const pixel_delta_u = viewport_u.div(@floatFromInt(image_width));
-        const pixel_delta_v = viewport_v.div(@floatFromInt(image_height));
+        const pixel_delta_u = div(viewport_u, @floatFromInt(image_width));
+        const pixel_delta_v = div(viewport_v, @floatFromInt(image_height));
 
         // Calculate the location of the upper left pixel
-        const viewport_upper_left = center
-            .sub(w.mul(focus_dist))
-            .sub(viewport_u.div(2.0))
-            .sub(viewport_v.div(2.0));
+        const viewport_upper_left = sub(sub(sub(center, mul(w, focus_dist)), div(viewport_u, 2.0)), div(viewport_v, 2.0));
 
-        const pixel00_loc = viewport_upper_left.add(pixel_delta_u.add(pixel_delta_v).mul(0.5));
+        const pixel00_loc = add(viewport_upper_left, mul(add(pixel_delta_u, pixel_delta_v), 0.5));
 
         // Calculate the camera defocus disk basis vectors
         const defocus_radius = focus_dist * @tan(degreesToRadians(defocus_angle / 2.0));
-        const defocus_disk_u = u.mul(defocus_radius);
-        const defocus_disk_v = v.mul(defocus_radius);
+        const defocus_disk_u = mul(u, defocus_radius);
+        const defocus_disk_v = mul(v, defocus_radius);
 
         return Camera{
             .image_width = image_width,
@@ -493,18 +474,16 @@ const Camera = struct {
         const offset_u = randomFloat(rng) - 0.5;
         const offset_v = randomFloat(rng) - 0.5;
 
-        const pixel_sample = self.pixel00_loc
-            .add(self.pixel_delta_u.mul(@as(f64, @floatFromInt(i)) + offset_u))
-            .add(self.pixel_delta_v.mul(@as(f64, @floatFromInt(j)) + offset_v));
+        const pixel_sample = add(add(self.pixel00_loc, mul(self.pixel_delta_u, @as(f64, @floatFromInt(i)) + offset_u)), mul(self.pixel_delta_v, @as(f64, @floatFromInt(j)) + offset_v));
 
         const ray_origin = if (self.defocus_angle <= 0) self.center else self.defocusDiskSample(rng);
-        const ray_direction = pixel_sample.sub(ray_origin);
+        const ray_direction = sub(pixel_sample, ray_origin);
         return Ray.init(ray_origin, ray_direction);
     }
 
     fn defocusDiskSample(self: Camera, rng: std.Random) Point3 {
         const p = randomInUnitDisk(rng);
-        return self.center.add(self.defocus_disk_u.mul(p.x)).add(self.defocus_disk_v.mul(p.y));
+        return add(add(self.center, mul(self.defocus_disk_u, p[0])), mul(self.defocus_disk_v, p[1]));
     }
 };
 
@@ -513,9 +492,9 @@ const Camera = struct {
 // ============================================================================
 
 fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
-    var r = color.x;
-    var g = color.y;
-    var b = color.z;
+    var r = color[0];
+    var g = color[1];
+    var b = color[2];
 
     // Divide the color by the number of samples
     const scale = 1.0 / @as(f64, @floatFromInt(samples_per_pixel));
@@ -576,7 +555,7 @@ const PixelBuffer = struct {
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !PixelBuffer {
         const pixels = try allocator.alloc(Color, width * height);
-        @memset(pixels, Color{ .x = 0, .y = 0, .z = 0 });
+        @memset(pixels, Color{ 0, 0, 0 });
         return PixelBuffer{
             .pixels = pixels,
             .width = width,
@@ -672,13 +651,13 @@ fn workerThread(ctx: *WorkerContext) void {
         while (y < tile.end_y) : (y += 1) {
             var x = tile.start_x;
             while (x < tile.end_x) : (x += 1) {
-                var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
+                var pixel_color = Color{ 0, 0, 0 };
 
                 // Multiple samples per pixel
                 var sample: u32 = 0;
                 while (sample < ctx.samples_per_pixel) : (sample += 1) {
                     const ray = ctx.camera.getRay(x, y, rng);
-                    pixel_color = pixel_color.add(rayColor(ray, ctx.world.*, ctx.max_depth, rng));
+                    pixel_color = add(pixel_color, rayColor(ray, ctx.world.*, ctx.max_depth, rng));
                 }
 
                 // Write to shared buffer (no race condition - each thread writes different tiles)
@@ -710,9 +689,9 @@ pub fn main() !void {
 
     // Ground
     try sphere_list.append(allocator, Sphere.init(
-        Point3{ .x = 0, .y = -1000, .z = 0 },
+        Point3{ 0, -1000, 0 },
         1000,
-        Material.lambertian(Color{ .x = 0.5, .y = 0.5, .z = 0.5 }),
+        Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
     ));
 
     // Random small spheres
@@ -722,26 +701,26 @@ pub fn main() !void {
         while (b < 11) : (b += 1) {
             const choose_mat = randomFloat(scene_rng);
             const center = Point3{
-                .x = @as(f64, @floatFromInt(a)) + 0.9 * randomFloat(scene_rng),
-                .y = 0.2,
-                .z = @as(f64, @floatFromInt(b)) + 0.9 * randomFloat(scene_rng),
+                @as(f64, @floatFromInt(a)) + 0.9 * randomFloat(scene_rng),
+                0.2,
+                @as(f64, @floatFromInt(b)) + 0.9 * randomFloat(scene_rng),
             };
 
-            if (center.sub(Point3{ .x = 4, .y = 0.2, .z = 0 }).length() > 0.9) {
+            if (length(sub(center, Point3{ 4, 0.2, 0 })) > 0.9) {
                 if (choose_mat < 0.8) {
                     // Diffuse
                     const albedo = Color{
-                        .x = randomFloat(scene_rng) * randomFloat(scene_rng),
-                        .y = randomFloat(scene_rng) * randomFloat(scene_rng),
-                        .z = randomFloat(scene_rng) * randomFloat(scene_rng),
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
                     };
                     try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.lambertian(albedo)));
                 } else if (choose_mat < 0.95) {
                     // Metal
                     const albedo = Color{
-                        .x = randomFloatRange(scene_rng, 0.5, 1.0),
-                        .y = randomFloatRange(scene_rng, 0.5, 1.0),
-                        .z = randomFloatRange(scene_rng, 0.5, 1.0),
+                        randomFloatRange(scene_rng, 0.5, 1.0),
+                        randomFloatRange(scene_rng, 0.5, 1.0),
+                        randomFloatRange(scene_rng, 0.5, 1.0),
                     };
                     const fuzz = randomFloatRange(scene_rng, 0.0, 0.5);
                     try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.metal(albedo, fuzz)));
@@ -754,18 +733,18 @@ pub fn main() !void {
     }
 
     // Three large spheres
-    try sphere_list.append(allocator, Sphere.init(Point3{ .x = 0, .y = 1, .z = 0 }, 1.0, Material.dielectric(1.5)));
-    try sphere_list.append(allocator, Sphere.init(Point3{ .x = -4, .y = 1, .z = 0 }, 1.0, Material.lambertian(Color{ .x = 0.4, .y = 0.2, .z = 0.1 })));
-    try sphere_list.append(allocator, Sphere.init(Point3{ .x = 4, .y = 1, .z = 0 }, 1.0, Material.metal(Color{ .x = 0.7, .y = 0.6, .z = 0.5 }, 0.0)));
+    try sphere_list.append(allocator, Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)));
+    try sphere_list.append(allocator, Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })));
+    try sphere_list.append(allocator, Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)));
 
     const world = HittableList.init(sphere_list.items);
 
     // Camera setup - use lower resolution/samples for reasonable render time
     // Final scene settings: width=1200, samples=500 (takes hours to render)
     const camera = Camera.init(
-        Point3{ .x = 13, .y = 2, .z = 3 }, // lookfrom
-        Point3{ .x = 0, .y = 0, .z = 0 }, // lookat
-        Vec3{ .x = 0, .y = 1, .z = 0 }, // vup
+        Point3{ 13, 2, 3 }, // lookfrom
+        Point3{ 0, 0, 0 }, // lookat
+        Vec3{ 0, 1, 0 }, // vup
         20.0, // vfov
         16.0 / 9.0, // aspect ratio
         1200, // image width (use 1200 for final)
@@ -862,13 +841,13 @@ pub fn main() !void {
 
             var i: u32 = 0;
             while (i < camera.image_width) : (i += 1) {
-                var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
+                var pixel_color = Color{ 0, 0, 0 };
 
                 // Take multiple samples per pixel
                 var sample: u32 = 0;
                 while (sample < samples_per_pixel) : (sample += 1) {
                     const ray = camera.getRay(i, j, rng);
-                    pixel_color = pixel_color.add(rayColor(ray, world, max_depth, rng));
+                    pixel_color = add(pixel_color, rayColor(ray, world, max_depth, rng));
                 }
 
                 try writeColor(file, pixel_color, samples_per_pixel);
