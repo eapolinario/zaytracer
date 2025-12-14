@@ -1,6 +1,14 @@
 const std = @import("std");
 
 // ============================================================================
+// Math Utilities
+// ============================================================================
+
+fn degreesToRadians(degrees: f64) f64 {
+    return degrees * std.math.pi / 180.0;
+}
+
+// ============================================================================
 // Random Utilities
 // ============================================================================
 
@@ -396,6 +404,79 @@ fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
 }
 
 // ============================================================================
+// Camera
+// ============================================================================
+
+const Camera = struct {
+    image_width: u32,
+    image_height: u32,
+    center: Point3,
+    pixel00_loc: Point3,
+    pixel_delta_u: Vec3,
+    pixel_delta_v: Vec3,
+
+    pub fn init(
+        lookfrom: Point3,
+        lookat: Point3,
+        vup: Vec3,
+        vfov: f64, // Vertical field of view in degrees
+        aspect_ratio: f64,
+        image_width: u32,
+    ) Camera {
+        const image_height = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
+
+        const theta = degreesToRadians(vfov);
+        const h = @tan(theta / 2.0);
+        const viewport_height = 2.0 * h;
+        const viewport_width = viewport_height * (@as(f64, @floatFromInt(image_width)) / @as(f64, @floatFromInt(image_height)));
+
+        // Calculate camera basis vectors
+        const w = lookfrom.sub(lookat).unitVector();
+        const u = vup.cross(w).unitVector();
+        const v = w.cross(u);
+
+        const center = lookfrom;
+
+        // Calculate the vectors across the horizontal and down the vertical viewport edges
+        const viewport_u = u.mul(viewport_width);
+        const viewport_v = v.neg().mul(viewport_height);
+
+        // Calculate the horizontal and vertical delta vectors from pixel to pixel
+        const pixel_delta_u = viewport_u.div(@floatFromInt(image_width));
+        const pixel_delta_v = viewport_v.div(@floatFromInt(image_height));
+
+        // Calculate the location of the upper left pixel
+        const viewport_upper_left = center
+            .sub(w)
+            .sub(viewport_u.div(2.0))
+            .sub(viewport_v.div(2.0));
+
+        const pixel00_loc = viewport_upper_left.add(pixel_delta_u.add(pixel_delta_v).mul(0.5));
+
+        return Camera{
+            .image_width = image_width,
+            .image_height = image_height,
+            .center = center,
+            .pixel00_loc = pixel00_loc,
+            .pixel_delta_u = pixel_delta_u,
+            .pixel_delta_v = pixel_delta_v,
+        };
+    }
+
+    pub fn getRay(self: Camera, i: u32, j: u32, rng: std.Random) Ray {
+        const offset_u = randomFloat(rng) - 0.5;
+        const offset_v = randomFloat(rng) - 0.5;
+
+        const pixel_sample = self.pixel00_loc
+            .add(self.pixel_delta_u.mul(@as(f64, @floatFromInt(i)) + offset_u))
+            .add(self.pixel_delta_v.mul(@as(f64, @floatFromInt(j)) + offset_v));
+
+        const ray_direction = pixel_sample.sub(self.center);
+        return Ray.init(self.center, ray_direction);
+    }
+};
+
+// ============================================================================
 // Color Utilities
 // ============================================================================
 
@@ -446,10 +527,16 @@ pub fn main() !void {
     };
     const world = HittableList.init(&spheres);
 
-    // Image dimensions
-    const aspect_ratio: f64 = 16.0 / 9.0;
-    const image_width: u32 = 400;
-    const image_height: u32 = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
+    // Camera setup
+    const camera = Camera.init(
+        Point3{ .x = -2, .y = 2, .z = 1 }, // lookfrom
+        Point3{ .x = 0, .y = 0, .z = -1 }, // lookat
+        Vec3{ .x = 0, .y = 1, .z = 0 },    // vup
+        90.0,                               // vfov
+        16.0 / 9.0,                        // aspect ratio
+        400,                               // image width
+    );
+
     const samples_per_pixel: u32 = 100;
     const max_depth: i32 = 50;
 
@@ -457,59 +544,28 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(42);
     const rng = prng.random();
 
-    // Camera
-    const focal_length: f64 = 1.0;
-    const viewport_height: f64 = 2.0;
-    const viewport_width: f64 = viewport_height * (@as(f64, @floatFromInt(image_width)) / @as(f64, @floatFromInt(image_height)));
-    const camera_center = Point3{ .x = 0, .y = 0, .z = 0 };
-
-    // Calculate the vectors across the horizontal and down the vertical viewport edges
-    const viewport_u = Vec3{ .x = viewport_width, .y = 0, .z = 0 };
-    const viewport_v = Vec3{ .x = 0, .y = -viewport_height, .z = 0 };
-
-    // Calculate the horizontal and vertical delta vectors from pixel to pixel
-    const pixel_delta_u = viewport_u.div(@floatFromInt(image_width));
-    const pixel_delta_v = viewport_v.div(@floatFromInt(image_height));
-
-    // Calculate the location of the upper left pixel
-    const viewport_upper_left = camera_center
-        .sub(Vec3{ .x = 0, .y = 0, .z = focal_length })
-        .sub(viewport_u.div(2.0))
-        .sub(viewport_v.div(2.0));
-
-    const pixel00_loc = viewport_upper_left.add(pixel_delta_u.add(pixel_delta_v).mul(0.5));
-
     // Create output file
     const file = try std.fs.cwd().createFile("image.ppm", .{});
     defer file.close();
 
     // Write PPM header
     var header_buf: [256]u8 = undefined;
-    const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ image_width, image_height });
+    const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ camera.image_width, camera.image_height });
     _ = try file.writeAll(header);
 
     // Render
     var j: u32 = 0;
-    while (j < image_height) : (j += 1) {
-        std.debug.print("\rScanlines remaining: {d} ", .{image_height - j});
+    while (j < camera.image_height) : (j += 1) {
+        std.debug.print("\rScanlines remaining: {d} ", .{camera.image_height - j});
 
         var i: u32 = 0;
-        while (i < image_width) : (i += 1) {
+        while (i < camera.image_width) : (i += 1) {
             var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
 
             // Take multiple samples per pixel
             var sample: u32 = 0;
             while (sample < samples_per_pixel) : (sample += 1) {
-                const offset_u = randomFloat(rng) - 0.5;
-                const offset_v = randomFloat(rng) - 0.5;
-
-                const pixel_sample = pixel00_loc
-                    .add(pixel_delta_u.mul(@as(f64, @floatFromInt(i)) + offset_u))
-                    .add(pixel_delta_v.mul(@as(f64, @floatFromInt(j)) + offset_v));
-
-                const ray_direction = pixel_sample.sub(camera_center);
-                const ray = Ray.init(camera_center, ray_direction);
-
+                const ray = camera.getRay(i, j, rng);
                 pixel_color = pixel_color.add(rayColor(ray, world, max_depth, rng));
             }
 
