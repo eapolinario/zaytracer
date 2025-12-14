@@ -49,6 +49,19 @@ fn randomUnitVector(rng: std.Random) Vec3 {
     return randomInUnitSphere(rng).unitVector();
 }
 
+fn randomInUnitDisk(rng: std.Random) Vec3 {
+    while (true) {
+        const p = Vec3{
+            .x = randomFloatRange(rng, -1.0, 1.0),
+            .y = randomFloatRange(rng, -1.0, 1.0),
+            .z = 0.0,
+        };
+        if (p.lengthSquared() < 1.0) {
+            return p;
+        }
+    }
+}
+
 // ============================================================================
 // Vec3 - 3D Vector/Point/Color
 // ============================================================================
@@ -414,6 +427,9 @@ const Camera = struct {
     pixel00_loc: Point3,
     pixel_delta_u: Vec3,
     pixel_delta_v: Vec3,
+    defocus_disk_u: Vec3,
+    defocus_disk_v: Vec3,
+    defocus_angle: f64,
 
     pub fn init(
         lookfrom: Point3,
@@ -422,12 +438,14 @@ const Camera = struct {
         vfov: f64, // Vertical field of view in degrees
         aspect_ratio: f64,
         image_width: u32,
+        defocus_angle: f64, // Variation angle of rays through each pixel
+        focus_dist: f64, // Distance from camera lookfrom point to plane of perfect focus
     ) Camera {
         const image_height = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(image_width)) / aspect_ratio)));
 
         const theta = degreesToRadians(vfov);
         const h = @tan(theta / 2.0);
-        const viewport_height = 2.0 * h;
+        const viewport_height = 2.0 * h * focus_dist;
         const viewport_width = viewport_height * (@as(f64, @floatFromInt(image_width)) / @as(f64, @floatFromInt(image_height)));
 
         // Calculate camera basis vectors
@@ -447,11 +465,16 @@ const Camera = struct {
 
         // Calculate the location of the upper left pixel
         const viewport_upper_left = center
-            .sub(w)
+            .sub(w.mul(focus_dist))
             .sub(viewport_u.div(2.0))
             .sub(viewport_v.div(2.0));
 
         const pixel00_loc = viewport_upper_left.add(pixel_delta_u.add(pixel_delta_v).mul(0.5));
+
+        // Calculate the camera defocus disk basis vectors
+        const defocus_radius = focus_dist * @tan(degreesToRadians(defocus_angle / 2.0));
+        const defocus_disk_u = u.mul(defocus_radius);
+        const defocus_disk_v = v.mul(defocus_radius);
 
         return Camera{
             .image_width = image_width,
@@ -460,6 +483,9 @@ const Camera = struct {
             .pixel00_loc = pixel00_loc,
             .pixel_delta_u = pixel_delta_u,
             .pixel_delta_v = pixel_delta_v,
+            .defocus_disk_u = defocus_disk_u,
+            .defocus_disk_v = defocus_disk_v,
+            .defocus_angle = defocus_angle,
         };
     }
 
@@ -471,8 +497,14 @@ const Camera = struct {
             .add(self.pixel_delta_u.mul(@as(f64, @floatFromInt(i)) + offset_u))
             .add(self.pixel_delta_v.mul(@as(f64, @floatFromInt(j)) + offset_v));
 
-        const ray_direction = pixel_sample.sub(self.center);
-        return Ray.init(self.center, ray_direction);
+        const ray_origin = if (self.defocus_angle <= 0) self.center else self.defocusDiskSample(rng);
+        const ray_direction = pixel_sample.sub(ray_origin);
+        return Ray.init(ray_origin, ray_direction);
+    }
+
+    fn defocusDiskSample(self: Camera, rng: std.Random) Point3 {
+        const p = randomInUnitDisk(rng);
+        return self.center.add(self.defocus_disk_u.mul(p.x)).add(self.defocus_disk_v.mul(p.y));
     }
 };
 
@@ -532,9 +564,11 @@ pub fn main() !void {
         Point3{ .x = -2, .y = 2, .z = 1 }, // lookfrom
         Point3{ .x = 0, .y = 0, .z = -1 }, // lookat
         Vec3{ .x = 0, .y = 1, .z = 0 },    // vup
-        90.0,                               // vfov
+        20.0,                               // vfov
         16.0 / 9.0,                        // aspect ratio
         400,                               // image width
+        10.0,                               // defocus angle
+        3.4,                                // focus distance
     );
 
     const samples_per_pixel: u32 = 100;
