@@ -543,35 +543,84 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
 // ============================================================================
 
 pub fn main() !void {
-    // World - create a scene with different materials
-    const material_ground = Material.lambertian(Color{ .x = 0.8, .y = 0.8, .z = 0.0 });
-    const material_center = Material.lambertian(Color{ .x = 0.1, .y = 0.2, .z = 0.5 });
-    const material_left = Material.dielectric(1.5);
-    const material_left_inner = Material.dielectric(1.5);
-    const material_right = Material.metal(Color{ .x = 0.8, .y = 0.6, .z = 0.2 }, 0.0);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    const spheres = [_]Sphere{
-        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100, material_ground),    // Ground
-        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1.2 }, 0.5, material_center),        // Center
-        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, 0.5, material_left),         // Left (glass)
-        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, -0.4, material_left_inner), // Left inner (hollow glass)
-        Sphere.init(Point3{ .x = 1.0, .y = 0, .z = -1 }, 0.5, material_right),         // Right (metal)
-    };
-    const world = HittableList.init(&spheres);
+    // Random number generator for scene generation
+    var scene_prng = std.Random.DefaultPrng.init(0);
+    const scene_rng = scene_prng.random();
 
-    // Camera setup
+    // Build final scene with many random spheres
+    var sphere_list = try std.ArrayList(Sphere).initCapacity(allocator, 500);
+    defer sphere_list.deinit(allocator);
+
+    // Ground
+    try sphere_list.append(allocator, Sphere.init(
+        Point3{ .x = 0, .y = -1000, .z = 0 },
+        1000,
+        Material.lambertian(Color{ .x = 0.5, .y = 0.5, .z = 0.5 }),
+    ));
+
+    // Random small spheres
+    var a: i32 = -11;
+    while (a < 11) : (a += 1) {
+        var b: i32 = -11;
+        while (b < 11) : (b += 1) {
+            const choose_mat = randomFloat(scene_rng);
+            const center = Point3{
+                .x = @as(f64, @floatFromInt(a)) + 0.9 * randomFloat(scene_rng),
+                .y = 0.2,
+                .z = @as(f64, @floatFromInt(b)) + 0.9 * randomFloat(scene_rng),
+            };
+
+            if (center.sub(Point3{ .x = 4, .y = 0.2, .z = 0 }).length() > 0.9) {
+                if (choose_mat < 0.8) {
+                    // Diffuse
+                    const albedo = Color{
+                        .x = randomFloat(scene_rng) * randomFloat(scene_rng),
+                        .y = randomFloat(scene_rng) * randomFloat(scene_rng),
+                        .z = randomFloat(scene_rng) * randomFloat(scene_rng),
+                    };
+                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.lambertian(albedo)));
+                } else if (choose_mat < 0.95) {
+                    // Metal
+                    const albedo = Color{
+                        .x = randomFloatRange(scene_rng, 0.5, 1.0),
+                        .y = randomFloatRange(scene_rng, 0.5, 1.0),
+                        .z = randomFloatRange(scene_rng, 0.5, 1.0),
+                    };
+                    const fuzz = randomFloatRange(scene_rng, 0.0, 0.5);
+                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.metal(albedo, fuzz)));
+                } else {
+                    // Glass
+                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.dielectric(1.5)));
+                }
+            }
+        }
+    }
+
+    // Three large spheres
+    try sphere_list.append(allocator, Sphere.init(Point3{ .x = 0, .y = 1, .z = 0 }, 1.0, Material.dielectric(1.5)));
+    try sphere_list.append(allocator, Sphere.init(Point3{ .x = -4, .y = 1, .z = 0 }, 1.0, Material.lambertian(Color{ .x = 0.4, .y = 0.2, .z = 0.1 })));
+    try sphere_list.append(allocator, Sphere.init(Point3{ .x = 4, .y = 1, .z = 0 }, 1.0, Material.metal(Color{ .x = 0.7, .y = 0.6, .z = 0.5 }, 0.0)));
+
+    const world = HittableList.init(sphere_list.items);
+
+    // Camera setup - use lower resolution/samples for reasonable render time
+    // Final scene settings: width=1200, samples=500 (takes hours to render)
     const camera = Camera.init(
-        Point3{ .x = -2, .y = 2, .z = 1 }, // lookfrom
-        Point3{ .x = 0, .y = 0, .z = -1 }, // lookat
+        Point3{ .x = 13, .y = 2, .z = 3 }, // lookfrom
+        Point3{ .x = 0, .y = 0, .z = 0 },  // lookat
         Vec3{ .x = 0, .y = 1, .z = 0 },    // vup
         20.0,                               // vfov
         16.0 / 9.0,                        // aspect ratio
-        400,                               // image width
-        10.0,                               // defocus angle
-        3.4,                                // focus distance
+        400,                               // image width (use 1200 for final)
+        0.6,                                // defocus angle
+        10.0,                               // focus distance
     );
 
-    const samples_per_pixel: u32 = 100;
+    const samples_per_pixel: u32 = 100; // Use 500 for final quality
     const max_depth: i32 = 50;
 
     // Random number generator
