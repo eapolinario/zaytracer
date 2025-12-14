@@ -133,6 +133,68 @@ const Point3 = Vec3;
 const Color = Vec3;
 
 // ============================================================================
+// Vector Utilities
+// ============================================================================
+
+fn reflect(v: Vec3, n: Vec3) Vec3 {
+    return v.sub(n.mul(2.0 * v.dot(n)));
+}
+
+// ============================================================================
+// Material
+// ============================================================================
+
+const MaterialType = enum {
+    lambertian,
+    metal,
+};
+
+const Material = struct {
+    material_type: MaterialType,
+    albedo: Color,
+    fuzz: f64, // Only used for metal
+
+    pub fn lambertian(albedo: Color) Material {
+        return Material{
+            .material_type = .lambertian,
+            .albedo = albedo,
+            .fuzz = 0.0,
+        };
+    }
+
+    pub fn metal(albedo: Color, fuzz: f64) Material {
+        return Material{
+            .material_type = .metal,
+            .albedo = albedo,
+            .fuzz = if (fuzz < 1.0) fuzz else 1.0,
+        };
+    }
+
+    pub fn scatter(self: Material, ray_in: Ray, rec: HitRecord, attenuation: *Color, scattered: *Ray, rng: std.Random) bool {
+        switch (self.material_type) {
+            .lambertian => {
+                var scatter_direction = rec.normal.add(randomUnitVector(rng));
+
+                // Catch degenerate scatter direction
+                if (scatter_direction.nearZero()) {
+                    scatter_direction = rec.normal;
+                }
+
+                scattered.* = Ray.init(rec.point, scatter_direction);
+                attenuation.* = self.albedo;
+                return true;
+            },
+            .metal => {
+                const reflected = reflect(ray_in.direction.unitVector(), rec.normal);
+                scattered.* = Ray.init(rec.point, reflected.add(randomInUnitSphere(rng).mul(self.fuzz)));
+                attenuation.* = self.albedo;
+                return scattered.direction.dot(rec.normal) > 0;
+            },
+        }
+    }
+};
+
+// ============================================================================
 // Ray
 // ============================================================================
 
@@ -173,6 +235,7 @@ const Interval = struct {
 const HitRecord = struct {
     point: Point3,
     normal: Vec3,
+    material: Material,
     t: f64,
     front_face: bool,
 
@@ -189,9 +252,10 @@ const HitRecord = struct {
 const Sphere = struct {
     center: Point3,
     radius: f64,
+    material: Material,
 
-    pub fn init(center: Point3, radius: f64) Sphere {
-        return Sphere{ .center = center, .radius = radius };
+    pub fn init(center: Point3, radius: f64, material: Material) Sphere {
+        return Sphere{ .center = center, .radius = radius, .material = material };
     }
 
     pub fn hit(self: Sphere, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
@@ -218,6 +282,7 @@ const Sphere = struct {
 
         rec.t = root;
         rec.point = ray.at(rec.t);
+        rec.material = self.material;
         const outward_normal = rec.point.sub(self.center).div(self.radius);
         rec.setFaceNormal(ray, outward_normal);
 
@@ -266,10 +331,13 @@ fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
     var rec: HitRecord = undefined;
 
     if (world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
-        // Diffuse (Lambertian) reflection
-        const direction = rec.normal.add(randomUnitVector(rng));
-        const scattered = Ray.init(rec.point, direction);
-        return rayColor(scattered, world, depth - 1, rng).mul(0.5);
+        var scattered: Ray = undefined;
+        var attenuation: Color = undefined;
+
+        if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
+            return attenuation.mulVec(rayColor(scattered, world, depth - 1, rng));
+        }
+        return Color{ .x = 0, .y = 0, .z = 0 };
     }
 
     // Create a gradient background from white to blue
@@ -318,10 +386,17 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
 // ============================================================================
 
 pub fn main() !void {
-    // World - create a scene with two spheres
+    // World - create a scene with different materials
+    const material_ground = Material.lambertian(Color{ .x = 0.8, .y = 0.8, .z = 0.0 });
+    const material_center = Material.lambertian(Color{ .x = 0.1, .y = 0.2, .z = 0.5 });
+    const material_left = Material.metal(Color{ .x = 0.8, .y = 0.8, .z = 0.8 }, 0.3);
+    const material_right = Material.metal(Color{ .x = 0.8, .y = 0.6, .z = 0.2 }, 1.0);
+
     const spheres = [_]Sphere{
-        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1 }, 0.5),      // Center sphere
-        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100), // Ground sphere
+        Sphere.init(Point3{ .x = 0, .y = -100.5, .z = -1 }, 100, material_ground), // Ground
+        Sphere.init(Point3{ .x = 0, .y = 0, .z = -1.2 }, 0.5, material_center),     // Center
+        Sphere.init(Point3{ .x = -1.0, .y = 0, .z = -1 }, 0.5, material_left),      // Left
+        Sphere.init(Point3{ .x = 1.0, .y = 0, .z = -1 }, 0.5, material_right),      // Right
     };
     const world = HittableList.init(&spheres);
 
