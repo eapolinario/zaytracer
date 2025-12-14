@@ -756,7 +756,7 @@ pub fn main() !void {
     const max_depth: i32 = 50;
 
     // Configuration
-    const use_multithreading = true; // Toggle between single/multi-threaded
+    const use_multithreading = true; // Toggle between single/multi-threaded (compile-time constant)
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
@@ -768,7 +768,7 @@ pub fn main() !void {
     const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ camera.image_width, camera.image_height });
     _ = try file.writeAll(header);
 
-    if (use_multithreading) {
+    if (comptime use_multithreading) {
         // ===== MULTI-THREADED PATH =====
         const num_threads = try std.Thread.getCpuCount();
         std.debug.print("Multi-threaded mode: Using {d} threads\n", .{num_threads});
