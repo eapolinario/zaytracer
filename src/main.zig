@@ -276,6 +276,120 @@ const Interval = struct {
     pub fn surrounds(self: Interval, x: f64) bool {
         return self.min < x and x < self.max;
     }
+
+    pub fn expand(self: Interval, delta: f64) Interval {
+        const padding = delta / 2.0;
+        return Interval{
+            .min = self.min - padding,
+            .max = self.max + padding,
+        };
+    }
+
+    pub fn size(self: Interval) f64 {
+        return self.max - self.min;
+    }
+
+    pub const empty = Interval{ .min = std.math.inf(f64), .max = -std.math.inf(f64) };
+    pub const universe = Interval{ .min = -std.math.inf(f64), .max = std.math.inf(f64) };
+};
+
+// ============================================================================
+// AABB - Axis-Aligned Bounding Box
+// ============================================================================
+
+const AABB = struct {
+    x: Interval,
+    y: Interval,
+    z: Interval,
+
+    pub fn init(x: Interval, y: Interval, z: Interval) AABB {
+        return AABB{ .x = x, .y = y, .z = z };
+    }
+
+    pub fn fromPoints(a: Point3, b: Point3) AABB {
+        // Create AABB from two corner points
+        return AABB{
+            .x = Interval{ .min = @min(a[0], b[0]), .max = @max(a[0], b[0]) },
+            .y = Interval{ .min = @min(a[1], b[1]), .max = @max(a[1], b[1]) },
+            .z = Interval{ .min = @min(a[2], b[2]), .max = @max(a[2], b[2]) },
+        };
+    }
+
+    pub fn fromBoxes(box0: AABB, box1: AABB) AABB {
+        // Create AABB that encloses two boxes
+        return AABB{
+            .x = Interval{
+                .min = @min(box0.x.min, box1.x.min),
+                .max = @max(box0.x.max, box1.x.max),
+            },
+            .y = Interval{
+                .min = @min(box0.y.min, box1.y.min),
+                .max = @max(box0.y.max, box1.y.max),
+            },
+            .z = Interval{
+                .min = @min(box0.z.min, box1.z.min),
+                .max = @max(box0.z.max, box1.z.max),
+            },
+        };
+    }
+
+    pub fn axis(self: AABB, n: usize) Interval {
+        return switch (n) {
+            0 => self.x,
+            1 => self.y,
+            2 => self.z,
+            else => unreachable,
+        };
+    }
+
+    pub fn hit(self: AABB, ray: Ray, ray_t: Interval) bool {
+        const ray_orig = ray.origin;
+        const ray_dir = ray.direction;
+
+        var t_min = ray_t.min;
+        var t_max = ray_t.max;
+
+        // Check intersection with each axis slab
+        inline for (0..3) |axis_idx| {
+            const ax = self.axis(axis_idx);
+            const inv_d = 1.0 / ray_dir[axis_idx];
+
+            const t0 = (ax.min - ray_orig[axis_idx]) * inv_d;
+            const t1 = (ax.max - ray_orig[axis_idx]) * inv_d;
+
+            if (inv_d < 0.0) {
+                t_min = @max(t_min, t1);
+                t_max = @min(t_max, t0);
+            } else {
+                t_min = @max(t_min, t0);
+                t_max = @min(t_max, t1);
+            }
+
+            if (t_max <= t_min) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    pub fn longestAxis(self: AABB) usize {
+        const x_size = self.x.size();
+        const y_size = self.y.size();
+        const z_size = self.z.size();
+
+        if (x_size > y_size) {
+            return if (x_size > z_size) 0 else 2;
+        } else {
+            return if (y_size > z_size) 1 else 2;
+        }
+    }
+
+    pub const empty = AABB{
+        .x = Interval.empty,
+        .y = Interval.empty,
+        .z = Interval.empty,
+    };
 };
 
 // ============================================================================
@@ -306,6 +420,11 @@ const Sphere = struct {
 
     pub fn init(center: Point3, radius: f64, material: Material) Sphere {
         return Sphere{ .center = center, .radius = radius, .material = material };
+    }
+
+    pub fn boundingBox(self: Sphere) AABB {
+        const rvec = Vec3{ self.radius, self.radius, self.radius };
+        return AABB.fromPoints(sub(self.center, rvec), add(self.center, rvec));
     }
 
     pub fn hit(self: Sphere, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
@@ -369,10 +488,167 @@ const HittableList = struct {
 };
 
 // ============================================================================
+// BVH - Bounding Volume Hierarchy
+// ============================================================================
+
+const BVHNode = struct {
+    bbox: AABB,
+    left: u32, // Index of left child (or first sphere index if leaf)
+    right: u32, // Index of right child (or past-the-end sphere index if leaf)
+    is_leaf: bool,
+
+    pub fn makeLeaf(bbox: AABB, first: u32, count: u32) BVHNode {
+        return BVHNode{
+            .bbox = bbox,
+            .left = first,
+            .right = first + count,
+            .is_leaf = true,
+        };
+    }
+
+    pub fn makeInterior(bbox: AABB, left: u32, right: u32) BVHNode {
+        return BVHNode{
+            .bbox = bbox,
+            .left = left,
+            .right = right,
+            .is_leaf = false,
+        };
+    }
+};
+
+const BVH = struct {
+    nodes: []BVHNode,
+    spheres: []const Sphere,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, spheres: []Sphere) !BVH {
+        if (spheres.len == 0) {
+            return BVH{
+                .nodes = &[_]BVHNode{},
+                .spheres = spheres,
+                .allocator = allocator,
+            };
+        }
+
+        // Allocate maximum possible nodes (2 * n - 1 for binary tree)
+        var nodes = try allocator.alloc(BVHNode, 2 * spheres.len);
+        var node_count: usize = 0;
+
+        // Build the BVH tree
+        _ = try buildBVH(allocator, spheres, 0, nodes, &node_count);
+
+        // Trim to actual size
+        nodes = try allocator.realloc(nodes, node_count);
+
+        return BVH{
+            .nodes = nodes,
+            .spheres = spheres,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: BVH) void {
+        self.allocator.free(self.nodes);
+    }
+
+    pub fn hit(self: BVH, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        if (self.nodes.len == 0) return false;
+        return hitNode(self, 0, ray, ray_t, rec);
+    }
+
+    fn hitNode(self: BVH, node_idx: u32, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        const node = self.nodes[node_idx];
+
+        // Early exit if ray doesn't hit bounding box
+        if (!node.bbox.hit(ray, ray_t)) {
+            return false;
+        }
+
+        if (node.is_leaf) {
+            // Test all spheres in this leaf
+            var hit_anything = false;
+            var closest_so_far = ray_t.max;
+            var temp_rec: HitRecord = undefined;
+
+            var i = node.left;
+            while (i < node.right) : (i += 1) {
+                if (self.spheres[i].hit(ray, Interval{ .min = ray_t.min, .max = closest_so_far }, &temp_rec)) {
+                    hit_anything = true;
+                    closest_so_far = temp_rec.t;
+                    rec.* = temp_rec;
+                }
+            }
+
+            return hit_anything;
+        } else {
+            // Test both children
+            var temp_rec: HitRecord = undefined;
+            const hit_left = hitNode(self, node.left, ray, ray_t, &temp_rec);
+            const closest_so_far = if (hit_left) temp_rec.t else ray_t.max;
+
+            const hit_right = hitNode(self, node.right, ray, Interval{ .min = ray_t.min, .max = closest_so_far }, rec);
+
+            if (hit_right) {
+                return true;
+            } else if (hit_left) {
+                rec.* = temp_rec;
+                return true;
+            }
+
+            return false;
+        }
+    }
+};
+
+fn buildBVH(allocator: std.mem.Allocator, spheres: []Sphere, sphere_offset: u32, nodes: []BVHNode, node_count: *usize) !u32 {
+    const node_idx = @as(u32, @intCast(node_count.*));
+    node_count.* += 1;
+
+    // Compute bounding box for all spheres
+    var bbox = spheres[0].boundingBox();
+    for (spheres[1..]) |sphere| {
+        bbox = AABB.fromBoxes(bbox, sphere.boundingBox());
+    }
+
+    // Leaf node if few spheres
+    const leaf_threshold = 4;
+    if (spheres.len <= leaf_threshold) {
+        nodes[node_idx] = BVHNode.makeLeaf(bbox, sphere_offset, @intCast(spheres.len));
+        return node_idx;
+    }
+
+    // Choose split axis (longest bbox axis)
+    const axis = bbox.longestAxis();
+
+    // Sort spheres along chosen axis
+    const SortContext = struct {
+        axis_idx: usize,
+
+        pub fn lessThan(ctx: @This(), a: Sphere, b: Sphere) bool {
+            return a.center[ctx.axis_idx] < b.center[ctx.axis_idx];
+        }
+    };
+
+    std.mem.sort(Sphere, spheres, SortContext{ .axis_idx = axis }, SortContext.lessThan);
+
+    // Split in the middle
+    const mid = spheres.len / 2;
+
+    // Recursively build left and right subtrees
+    const left_idx = try buildBVH(allocator, spheres[0..mid], sphere_offset, nodes, node_count);
+    const right_idx = try buildBVH(allocator, spheres[mid..], sphere_offset + @as(u32, @intCast(mid)), nodes, node_count);
+
+    // Create interior node
+    nodes[node_idx] = BVHNode.makeInterior(bbox, left_idx, right_idx);
+
+    return node_idx;
+}
+
+// ============================================================================
 // Ray Color (Background)
 // ============================================================================
 
-fn rayColor(ray: Ray, world: HittableList, depth: i32, rng: std.Random) Color {
+fn rayColor(ray: Ray, world: BVH, depth: i32, rng: std.Random) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
         return Color{ 0, 0, 0 };
@@ -612,7 +888,7 @@ const WorkerContext = struct {
     queue: *TileQueue,
     pixel_buffer: *PixelBuffer,
     camera: *const Camera,
-    world: *const HittableList,
+    world: *const BVH,
     samples_per_pixel: u32,
     max_depth: i32,
     thread_id: u32,
@@ -738,7 +1014,11 @@ pub fn main() !void {
     try sphere_list.append(allocator, Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })));
     try sphere_list.append(allocator, Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)));
 
-    const world = HittableList.init(sphere_list.items);
+    // Build BVH for efficient ray-object intersection
+    std.debug.print("Building BVH from {d} spheres...\n", .{sphere_list.items.len});
+    const world = try BVH.init(allocator, sphere_list.items);
+    defer world.deinit();
+    std.debug.print("BVH built with {d} nodes\n", .{world.nodes.len});
 
     // Camera setup - use lower resolution/samples for reasonable render time
     // Final scene settings: width=1200, samples=500 (takes hours to render)
