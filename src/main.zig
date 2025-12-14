@@ -539,6 +539,159 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
 }
 
 // ============================================================================
+// Multithreading Support
+// ============================================================================
+
+const Tile = struct {
+    start_x: u32,
+    start_y: u32,
+    end_x: u32,
+    end_y: u32,
+};
+
+const TileQueue = struct {
+    tiles: []const Tile,
+    current_index: std.atomic.Value(usize),
+
+    pub fn init(tiles: []const Tile) TileQueue {
+        return TileQueue{
+            .tiles = tiles,
+            .current_index = std.atomic.Value(usize).init(0),
+        };
+    }
+
+    pub fn getNextTile(self: *TileQueue) ?Tile {
+        const index = self.current_index.fetchAdd(1, .monotonic);
+        if (index >= self.tiles.len) {
+            return null;
+        }
+        return self.tiles[index];
+    }
+};
+
+const PixelBuffer = struct {
+    pixels: []Color,
+    width: u32,
+    height: u32,
+
+    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) !PixelBuffer {
+        const pixels = try allocator.alloc(Color, width * height);
+        @memset(pixels, Color{ .x = 0, .y = 0, .z = 0 });
+        return PixelBuffer{
+            .pixels = pixels,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    pub fn deinit(self: PixelBuffer, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+    }
+
+    pub fn set(self: *PixelBuffer, x: u32, y: u32, color: Color) void {
+        self.pixels[y * self.width + x] = color;
+    }
+
+    pub fn get(self: PixelBuffer, x: u32, y: u32) Color {
+        return self.pixels[y * self.width + x];
+    }
+};
+
+const Progress = struct {
+    completed_tiles: std.atomic.Value(usize),
+    total_tiles: usize,
+    mutex: std.Thread.Mutex,
+
+    pub fn init(total_tiles: usize) Progress {
+        return Progress{
+            .completed_tiles = std.atomic.Value(usize).init(0),
+            .total_tiles = total_tiles,
+            .mutex = .{},
+        };
+    }
+
+    pub fn increment(self: *Progress, thread_id: u32) void {
+        const completed = self.completed_tiles.fetchAdd(1, .monotonic) + 1;
+
+        // Print progress every 10 tiles to reduce output spam
+        if (completed % 10 == 0 or completed == self.total_tiles) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const percentage = @as(f64, @floatFromInt(completed)) / @as(f64, @floatFromInt(self.total_tiles)) * 100.0;
+            std.debug.print("\rProgress: {d:.1}% ({d}/{d} tiles) - Thread {d}    ", .{ percentage, completed, self.total_tiles, thread_id });
+        }
+    }
+
+    pub fn finish(self: *Progress) void {
+        std.debug.print("\rRendering complete: 100.0% ({d}/{d} tiles)\n", .{ self.total_tiles, self.total_tiles });
+    }
+};
+
+const WorkerContext = struct {
+    queue: *TileQueue,
+    pixel_buffer: *PixelBuffer,
+    camera: *const Camera,
+    world: *const HittableList,
+    samples_per_pixel: u32,
+    max_depth: i32,
+    thread_id: u32,
+    progress: *Progress,
+};
+
+fn generateTiles(allocator: std.mem.Allocator, width: u32, height: u32, tile_size: u32) ![]Tile {
+    var tiles = try std.ArrayList(Tile).initCapacity(allocator, 100);
+
+    var y: u32 = 0;
+    while (y < height) {
+        var x: u32 = 0;
+        while (x < width) {
+            try tiles.append(allocator, Tile{
+                .start_x = x,
+                .start_y = y,
+                .end_x = @min(x + tile_size, width),
+                .end_y = @min(y + tile_size, height),
+            });
+            x += tile_size;
+        }
+        y += tile_size;
+    }
+
+    return tiles.toOwnedSlice(allocator);
+}
+
+fn workerThread(ctx: *WorkerContext) void {
+    // Each thread gets unique RNG seed
+    var prng = std.Random.DefaultPrng.init(42 + @as(u64, ctx.thread_id) * 12345);
+    const rng = prng.random();
+
+    // Process tiles until queue is empty
+    while (ctx.queue.getNextTile()) |tile| {
+        // Render this tile
+        var y = tile.start_y;
+        while (y < tile.end_y) : (y += 1) {
+            var x = tile.start_x;
+            while (x < tile.end_x) : (x += 1) {
+                var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
+
+                // Multiple samples per pixel
+                var sample: u32 = 0;
+                while (sample < ctx.samples_per_pixel) : (sample += 1) {
+                    const ray = ctx.camera.getRay(x, y, rng);
+                    pixel_color = pixel_color.add(rayColor(ray, ctx.world.*, ctx.max_depth, rng));
+                }
+
+                // Write to shared buffer (no race condition - each thread writes different tiles)
+                ctx.pixel_buffer.set(x, y, pixel_color);
+            }
+        }
+
+        // Update progress
+        ctx.progress.increment(ctx.thread_id);
+    }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -611,21 +764,21 @@ pub fn main() !void {
     // Final scene settings: width=1200, samples=500 (takes hours to render)
     const camera = Camera.init(
         Point3{ .x = 13, .y = 2, .z = 3 }, // lookfrom
-        Point3{ .x = 0, .y = 0, .z = 0 },  // lookat
-        Vec3{ .x = 0, .y = 1, .z = 0 },    // vup
-        20.0,                               // vfov
-        16.0 / 9.0,                        // aspect ratio
-        400,                               // image width (use 1200 for final)
-        0.6,                                // defocus angle
-        10.0,                               // focus distance
+        Point3{ .x = 0, .y = 0, .z = 0 }, // lookat
+        Vec3{ .x = 0, .y = 1, .z = 0 }, // vup
+        20.0, // vfov
+        16.0 / 9.0, // aspect ratio
+        1200, // image width (use 1200 for final)
+        0.6, // defocus angle
+        10.0, // focus distance
     );
 
     const samples_per_pixel: u32 = 100; // Use 500 for final quality
     const max_depth: i32 = 50;
 
-    // Random number generator
-    var prng = std.Random.DefaultPrng.init(42);
-    const rng = prng.random();
+    // Configuration
+    const use_multithreading = true; // Toggle between single/multi-threaded
+    const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
     const file = try std.fs.cwd().createFile("image.ppm", .{});
@@ -636,23 +789,90 @@ pub fn main() !void {
     const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ camera.image_width, camera.image_height });
     _ = try file.writeAll(header);
 
-    // Render
-    var j: u32 = 0;
-    while (j < camera.image_height) : (j += 1) {
-        std.debug.print("\rScanlines remaining: {d} ", .{camera.image_height - j});
+    if (use_multithreading) {
+        // ===== MULTI-THREADED PATH =====
+        const num_threads = try std.Thread.getCpuCount();
+        std.debug.print("Multi-threaded mode: Using {d} threads\n", .{num_threads});
 
-        var i: u32 = 0;
-        while (i < camera.image_width) : (i += 1) {
-            var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
+        // Generate tiles
+        const tiles = try generateTiles(allocator, camera.image_width, camera.image_height, tile_size);
+        defer allocator.free(tiles);
+        std.debug.print("Generated {d} tiles of size {d}x{d}\n", .{ tiles.len, tile_size, tile_size });
 
-            // Take multiple samples per pixel
-            var sample: u32 = 0;
-            while (sample < samples_per_pixel) : (sample += 1) {
-                const ray = camera.getRay(i, j, rng);
-                pixel_color = pixel_color.add(rayColor(ray, world, max_depth, rng));
+        // Create tile queue and progress tracker
+        var tile_queue = TileQueue.init(tiles);
+        var progress = Progress.init(tiles.len);
+
+        // Create shared pixel buffer
+        var pixel_buffer = try PixelBuffer.init(allocator, camera.image_width, camera.image_height);
+        defer pixel_buffer.deinit(allocator);
+
+        // Spawn worker threads
+        var threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+
+        var contexts = try allocator.alloc(WorkerContext, num_threads);
+        defer allocator.free(contexts);
+
+        std.debug.print("Starting render...\n", .{});
+        for (0..num_threads) |i| {
+            contexts[i] = WorkerContext{
+                .queue = &tile_queue,
+                .pixel_buffer = &pixel_buffer,
+                .camera = &camera,
+                .world = &world,
+                .samples_per_pixel = samples_per_pixel,
+                .max_depth = max_depth,
+                .thread_id = @intCast(i),
+                .progress = &progress,
+            };
+
+            threads[i] = try std.Thread.spawn(.{}, workerThread, .{&contexts[i]});
+        }
+
+        // Wait for all threads to finish
+        for (threads) |thread| {
+            thread.join();
+        }
+
+        progress.finish();
+        std.debug.print("Writing to file...\n", .{});
+
+        // Write all pixels from buffer
+        var y: u32 = 0;
+        while (y < camera.image_height) : (y += 1) {
+            var x: u32 = 0;
+            while (x < camera.image_width) : (x += 1) {
+                const color = pixel_buffer.get(x, y);
+                try writeColor(file, color, samples_per_pixel);
             }
+        }
+    } else {
+        // ===== SINGLE-THREADED PATH (original) =====
+        std.debug.print("Single-threaded mode\n", .{});
 
-            try writeColor(file, pixel_color, samples_per_pixel);
+        // Random number generator
+        var prng = std.Random.DefaultPrng.init(42);
+        const rng = prng.random();
+
+        // Render
+        var j: u32 = 0;
+        while (j < camera.image_height) : (j += 1) {
+            std.debug.print("\rScanlines remaining: {d} ", .{camera.image_height - j});
+
+            var i: u32 = 0;
+            while (i < camera.image_width) : (i += 1) {
+                var pixel_color = Color{ .x = 0, .y = 0, .z = 0 };
+
+                // Take multiple samples per pixel
+                var sample: u32 = 0;
+                while (sample < samples_per_pixel) : (sample += 1) {
+                    const ray = camera.getRay(i, j, rng);
+                    pixel_color = pixel_color.add(rayColor(ray, world, max_depth, rng));
+                }
+
+                try writeColor(file, pixel_color, samples_per_pixel);
+            }
         }
     }
 
