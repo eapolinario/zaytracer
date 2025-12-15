@@ -1,12 +1,9 @@
-.PHONY: help build build-debug build-release build-single build-single-release \
-        run run-debug run-release run-single run-single-release \
-        run-both bench bench-debug bench-release bench-both clean test view view-debug view-release
+.PHONY: help build build-debug build-release \
+        run run-debug run-release run-both \
+        bench bench-debug bench-release bench-both clean test view view-debug view-release
 
 # Default target
 .DEFAULT_GOAL := help
-
-# Default build mode (can be overridden: make build MODE=release)
-MODE ?= debug
 
 # Multithreading flag (can be overridden: make build MULTITHREAD=false)
 MULTITHREAD ?= true
@@ -19,15 +16,11 @@ help:
 	@echo "  make build              - Build in default mode (Debug, multithreaded)"
 	@echo "  make build-debug        - Build in Debug mode (with safety checks)"
 	@echo "  make build-release      - Build in ReleaseFast mode (optimized)"
-	@echo "  make build-single       - Build Debug mode, single-threaded"
-	@echo "  make build-single-release - Build ReleaseFast mode, single-threaded"
 	@echo ""
 	@echo "Run targets:"
 	@echo "  make run                - Build and run in default mode"
 	@echo "  make run-debug          - Build and run in Debug mode"
 	@echo "  make run-release        - Build and run in ReleaseFast mode"
-	@echo "  make run-single         - Build and run Debug mode, single-threaded"
-	@echo "  make run-single-release - Build and run ReleaseFast, single-threaded"
 	@echo "  make run-both           - Run both modes and save separate images"
 	@echo ""
 	@echo "Benchmark targets:"
@@ -50,7 +43,9 @@ help:
 	@echo ""
 	@echo "Build options:"
 	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
-	@echo "  Example: make build MULTITHREAD=false"
+	@echo "  Examples:"
+	@echo "    make build MULTITHREAD=false       # Single-threaded debug build"
+	@echo "    make run-release MULTITHREAD=false # Single-threaded release run"
 
 # Build targets
 build: build-debug
@@ -63,14 +58,6 @@ build-release:
 	@echo "Building in ReleaseFast mode (multithreaded=$(MULTITHREAD))..."
 	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD)
 
-build-single:
-	@echo "Building in Debug mode (single-threaded)..."
-	zig build -Dmultithreading=false
-
-build-single-release:
-	@echo "Building in ReleaseFast mode (single-threaded)..."
-	zig build -Doptimize=ReleaseFast -Dmultithreading=false
-
 # Run targets
 run: run-debug
 
@@ -80,14 +67,6 @@ run-debug: build-debug
 
 run-release: build-release
 	@echo "Running ReleaseFast build..."
-	./zig-out/bin/zaytracer
-
-run-single: build-single
-	@echo "Running Debug build (single-threaded)..."
-	./zig-out/bin/zaytracer
-
-run-single-release: build-single-release
-	@echo "Running ReleaseFast build (single-threaded)..."
 	./zig-out/bin/zaytracer
 
 run-both: build-debug build-release
@@ -117,13 +96,13 @@ run-both: build-debug build-release
 bench-debug: build-debug
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm
-	time ./zig-out/bin/zaytracer
+	@bash -c 'time ./zig-out/bin/zaytracer'
 	@echo ""
 
 bench-release: build-release
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm
-	time ./zig-out/bin/zaytracer
+	@bash -c 'time ./zig-out/bin/zaytracer'
 	@echo ""
 
 bench:
@@ -149,7 +128,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm image-debug.ppm
-	time ./zig-out/bin/zaytracer
+	@bash -c 'time ./zig-out/bin/zaytracer'
 	@mv image.ppm image-debug.ppm
 	@echo "✓ Debug output saved to: image-debug.ppm"
 	@echo ""
@@ -157,7 +136,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm image-release.ppm
-	time ./zig-out/bin/zaytracer
+	@bash -c 'time ./zig-out/bin/zaytracer'
 	@mv image.ppm image-release.ppm
 	@echo "✓ Release output saved to: image-release.ppm"
 	@echo ""
