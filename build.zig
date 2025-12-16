@@ -7,8 +7,14 @@ pub fn build(b: *std.Build) void {
     // Build option for multithreading (default: true)
     const multithreading = b.option(bool, "multithreading", "Enable multithreaded rendering (default: true)") orelse true;
 
+    // Build options for image quality (for preview vs final renders)
+    const image_width = b.option(u32, "width", "Image width in pixels (default: 1200)") orelse 1200;
+    const samples_per_pixel = b.option(u32, "samples", "Samples per pixel for antialiasing (default: 100)") orelse 100;
+
     const options = b.addOptions();
     options.addOption(bool, "use_multithreading", multithreading);
+    options.addOption(u32, "image_width", image_width);
+    options.addOption(u32, "samples_per_pixel", samples_per_pixel);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

@@ -460,6 +460,184 @@ const Sphere = struct {
 };
 
 // ============================================================================
+// Hittable - Triangle
+// ============================================================================
+
+const Triangle = struct {
+    // Vertex positions
+    v0: Point3,
+    v1: Point3,
+    v2: Point3,
+
+    // Vertex normals (for smooth shading)
+    n0: Vec3,
+    n1: Vec3,
+    n2: Vec3,
+    has_normals: bool,
+
+    // Material
+    material: Material,
+    material_index: u32, // Future: per-face materials (currently unused, set to 0)
+
+    // Precomputed edges (performance optimization)
+    edge1: Vec3, // v1 - v0
+    edge2: Vec3, // v2 - v0
+
+    /// Initialize triangle with flat shading (face normal)
+    pub fn init(v0: Point3, v1: Point3, v2: Point3, material: Material) Triangle {
+        const edge1 = sub(v1, v0);
+        const edge2 = sub(v2, v0);
+        const flat_normal = unitVector(cross(edge1, edge2));
+
+        return Triangle{
+            .v0 = v0,
+            .v1 = v1,
+            .v2 = v2,
+            .n0 = flat_normal,
+            .n1 = flat_normal,
+            .n2 = flat_normal,
+            .has_normals = false,
+            .material = material,
+            .material_index = 0,
+            .edge1 = edge1,
+            .edge2 = edge2,
+        };
+    }
+
+    /// Initialize triangle with smooth shading (interpolated vertex normals)
+    pub fn initWithNormals(
+        v0: Point3,
+        v1: Point3,
+        v2: Point3,
+        n0: Vec3,
+        n1: Vec3,
+        n2: Vec3,
+        material: Material,
+    ) Triangle {
+        return Triangle{
+            .v0 = v0,
+            .v1 = v1,
+            .v2 = v2,
+            .n0 = unitVector(n0), // Normalize inputs
+            .n1 = unitVector(n1),
+            .n2 = unitVector(n2),
+            .has_normals = true,
+            .material = material,
+            .material_index = 0,
+            .edge1 = sub(v1, v0),
+            .edge2 = sub(v2, v0),
+        };
+    }
+
+    /// Compute axis-aligned bounding box for the triangle
+    pub fn boundingBox(self: Triangle) AABB {
+        // Find min/max of triangle vertices for each axis
+        const min_x = @min(@min(self.v0[0], self.v1[0]), self.v2[0]);
+        const max_x = @max(@max(self.v0[0], self.v1[0]), self.v2[0]);
+        const min_y = @min(@min(self.v0[1], self.v1[1]), self.v2[1]);
+        const max_y = @max(@max(self.v0[1], self.v1[1]), self.v2[1]);
+        const min_z = @min(@min(self.v0[2], self.v1[2]), self.v2[2]);
+        const max_z = @max(@max(self.v0[2], self.v1[2]), self.v2[2]);
+
+        // Add epsilon to prevent degenerate boxes (flat triangles have zero volume otherwise)
+        const epsilon = 0.0001;
+
+        return AABB{
+            .x = Interval{ .min = min_x - epsilon, .max = max_x + epsilon },
+            .y = Interval{ .min = min_y - epsilon, .max = max_y + epsilon },
+            .z = Interval{ .min = min_z - epsilon, .max = max_z + epsilon },
+        };
+    }
+
+    /// Möller-Trumbore ray-triangle intersection algorithm
+    /// Returns true if ray hits triangle, fills in hit record with barycentric-interpolated normal
+    pub fn hit(self: Triangle, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        const epsilon = 1e-8;
+
+        // Step 1: Calculate determinant (tests if ray is parallel to triangle)
+        const pvec = cross(ray.direction, self.edge2);
+        const det = dot(self.edge1, pvec);
+
+        // If determinant is near zero, ray is parallel to triangle
+        if (@abs(det) < epsilon) {
+            return false;
+        }
+
+        const inv_det = 1.0 / det;
+
+        // Step 2: Calculate u parameter (first barycentric coordinate)
+        const tvec = sub(ray.origin, self.v0);
+        const u = dot(tvec, pvec) * inv_det;
+
+        // Check if intersection is outside triangle (u bounds)
+        if (u < 0.0 or u > 1.0) {
+            return false;
+        }
+
+        // Step 3: Calculate v parameter (second barycentric coordinate)
+        const qvec = cross(tvec, self.edge1);
+        const v = dot(ray.direction, qvec) * inv_det;
+
+        // Check if intersection is outside triangle (v bounds)
+        if (v < 0.0 or u + v > 1.0) {
+            return false;
+        }
+
+        // Step 4: Calculate t (distance along ray)
+        const t = dot(self.edge2, qvec) * inv_det;
+
+        // Check if intersection is within valid ray interval
+        if (!ray_t.surrounds(t)) {
+            return false;
+        }
+
+        // Step 5: Valid hit! Fill in hit record
+        rec.t = t;
+        rec.point = ray.at(t);
+        rec.material = self.material;
+
+        // Interpolate normal using barycentric coordinates
+        // Barycentric coords: (w, u, v) where w = 1-u-v
+        // These are weights for (v0, v1, v2)
+        const w = 1.0 - u - v;
+
+        const outward_normal = if (self.has_normals)
+            // SMOOTH SHADING: Interpolate vertex normals
+            unitVector(add(add(mul(self.n0, w), mul(self.n1, u)), mul(self.n2, v)))
+        else
+            // FLAT SHADING: Use face normal
+            self.n0;
+
+        rec.setFaceNormal(ray, outward_normal);
+
+        return true;
+    }
+};
+
+// ============================================================================
+// Primitive - Union of all hittable primitives
+// ============================================================================
+
+const Primitive = union(enum) {
+    sphere: Sphere,
+    triangle: Triangle,
+
+    pub fn boundingBox(self: Primitive) AABB {
+        return switch (self) {
+            .sphere => |s| s.boundingBox(),
+            .triangle => |t| t.boundingBox(),
+        };
+    }
+
+    pub fn hit(self: Primitive, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
+        return switch (self) {
+            .sphere => |s| s.hit(ray, ray_t, rec),
+            .triangle => |t| t.hit(ray, ray_t, rec),
+        };
+    }
+};
+
+// ============================================================================
 // Hittable List
 // ============================================================================
 
@@ -493,8 +671,8 @@ const HittableList = struct {
 
 const BVHNode = struct {
     bbox: AABB,
-    left: u32, // Index of left child (or first sphere index if leaf)
-    right: u32, // Index of right child (or past-the-end sphere index if leaf)
+    left: u32, // Index of left child (or first primitive index if leaf)
+    right: u32, // Index of right child (or past-the-end primitive index if leaf)
     is_leaf: bool,
 
     pub fn makeLeaf(bbox: AABB, first: u32, count: u32) BVHNode {
@@ -518,31 +696,31 @@ const BVHNode = struct {
 
 const BVH = struct {
     nodes: []BVHNode,
-    spheres: []const Sphere,
+    primitives: []const Primitive,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, spheres: []Sphere) !BVH {
-        if (spheres.len == 0) {
+    pub fn init(allocator: std.mem.Allocator, primitives: []Primitive) !BVH {
+        if (primitives.len == 0) {
             return BVH{
                 .nodes = &[_]BVHNode{},
-                .spheres = spheres,
+                .primitives = primitives,
                 .allocator = allocator,
             };
         }
 
         // Allocate maximum possible nodes (2 * n - 1 for binary tree)
-        var nodes = try allocator.alloc(BVHNode, 2 * spheres.len);
+        var nodes = try allocator.alloc(BVHNode, 2 * primitives.len);
         var node_count: usize = 0;
 
         // Build the BVH tree
-        _ = try buildBVH(allocator, spheres, 0, nodes, &node_count);
+        _ = try buildBVH(allocator, primitives, 0, nodes, &node_count);
 
         // Trim to actual size
         nodes = try allocator.realloc(nodes, node_count);
 
         return BVH{
             .nodes = nodes,
-            .spheres = spheres,
+            .primitives = primitives,
             .allocator = allocator,
         };
     }
@@ -565,14 +743,14 @@ const BVH = struct {
         }
 
         if (node.is_leaf) {
-            // Test all spheres in this leaf
+            // Test all primitives in this leaf
             var hit_anything = false;
             var closest_so_far = ray_t.max;
             var temp_rec: HitRecord = undefined;
 
             var i = node.left;
             while (i < node.right) : (i += 1) {
-                if (self.spheres[i].hit(ray, Interval{ .min = ray_t.min, .max = closest_so_far }, &temp_rec)) {
+                if (self.primitives[i].hit(ray, Interval{ .min = ray_t.min, .max = closest_so_far }, &temp_rec)) {
                     hit_anything = true;
                     closest_so_far = temp_rec.t;
                     rec.* = temp_rec;
@@ -600,48 +778,439 @@ const BVH = struct {
     }
 };
 
-fn buildBVH(allocator: std.mem.Allocator, spheres: []Sphere, sphere_offset: u32, nodes: []BVHNode, node_count: *usize) !u32 {
+fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_offset: u32, nodes: []BVHNode, node_count: *usize) !u32 {
     const node_idx = @as(u32, @intCast(node_count.*));
     node_count.* += 1;
 
-    // Compute bounding box for all spheres
-    var bbox = spheres[0].boundingBox();
-    for (spheres[1..]) |sphere| {
-        bbox = AABB.fromBoxes(bbox, sphere.boundingBox());
+    // Compute bounding box for all primitives
+    var bbox = primitives[0].boundingBox();
+    for (primitives[1..]) |primitive| {
+        bbox = AABB.fromBoxes(bbox, primitive.boundingBox());
     }
 
-    // Leaf node if few spheres
+    // Leaf node if few primitives
     const leaf_threshold = 4;
-    if (spheres.len <= leaf_threshold) {
-        nodes[node_idx] = BVHNode.makeLeaf(bbox, sphere_offset, @intCast(spheres.len));
+    if (primitives.len <= leaf_threshold) {
+        nodes[node_idx] = BVHNode.makeLeaf(bbox, primitive_offset, @intCast(primitives.len));
         return node_idx;
     }
 
     // Choose split axis (longest bbox axis)
     const axis = bbox.longestAxis();
 
-    // Sort spheres along chosen axis
+    // Sort primitives along chosen axis
     const SortContext = struct {
         axis_idx: usize,
 
-        pub fn lessThan(ctx: @This(), a: Sphere, b: Sphere) bool {
-            return a.center[ctx.axis_idx] < b.center[ctx.axis_idx];
+        pub fn lessThan(ctx: @This(), a: Primitive, b: Primitive) bool {
+            // Compute center/centroid for each primitive type
+            const a_center = switch (a) {
+                .sphere => |s| s.center,
+                .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0), // Triangle centroid
+            };
+            const b_center = switch (b) {
+                .sphere => |s| s.center,
+                .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0),
+            };
+            return a_center[ctx.axis_idx] < b_center[ctx.axis_idx];
         }
     };
 
-    std.mem.sort(Sphere, spheres, SortContext{ .axis_idx = axis }, SortContext.lessThan);
+    std.mem.sort(Primitive, primitives, SortContext{ .axis_idx = axis }, SortContext.lessThan);
 
     // Split in the middle
-    const mid = spheres.len / 2;
+    const mid = primitives.len / 2;
 
     // Recursively build left and right subtrees
-    const left_idx = try buildBVH(allocator, spheres[0..mid], sphere_offset, nodes, node_count);
-    const right_idx = try buildBVH(allocator, spheres[mid..], sphere_offset + @as(u32, @intCast(mid)), nodes, node_count);
+    const left_idx = try buildBVH(allocator, primitives[0..mid], primitive_offset, nodes, node_count);
+    const right_idx = try buildBVH(allocator, primitives[mid..], primitive_offset + @as(u32, @intCast(mid)), nodes, node_count);
 
     // Create interior node
     nodes[node_idx] = BVHNode.makeInterior(bbox, left_idx, right_idx);
 
     return node_idx;
+}
+
+// ============================================================================
+// OBJ File Parser
+// ============================================================================
+
+const OBJParseError = error{
+    InvalidFormat,
+    MissingData,
+    InvalidIndex,
+} || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError;
+
+const OBJData = struct {
+    vertices: []Vec3,
+    normals: []Vec3,
+    faces: []Face,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: OBJData) void {
+        self.allocator.free(self.vertices);
+        self.allocator.free(self.normals);
+        self.allocator.free(self.faces);
+    }
+};
+
+const Face = struct {
+    // Vertex indices (0-based after conversion from OBJ's 1-based)
+    v0: u32,
+    v1: u32,
+    v2: u32,
+
+    // Normal indices (0xFFFFFFFF if not present)
+    n0: u32,
+    n1: u32,
+    n2: u32,
+
+    pub fn hasNormals(self: Face) bool {
+        return self.n0 != 0xFFFFFFFF and
+            self.n1 != 0xFFFFFFFF and
+            self.n2 != 0xFFFFFFFF;
+    }
+};
+
+const VertexDescriptor = struct {
+    v: u32, // vertex index (0-based)
+    n: u32, // normal index (0-based or 0xFFFFFFFF)
+};
+
+fn parseOBJ(allocator: std.mem.Allocator, filepath: []const u8) !OBJData {
+    const file = try std.fs.cwd().openFile(filepath, .{});
+    defer file.close();
+
+    // Read entire file (reasonable for small-medium meshes up to 50MB)
+    const max_file_size = 50 * 1024 * 1024;
+    const contents = try file.readToEndAlloc(allocator, max_file_size);
+    defer allocator.free(contents);
+
+    // Dynamic arrays for parsed data
+    var vertices = try std.ArrayList(Vec3).initCapacity(allocator, 100);
+    defer vertices.deinit(allocator);
+    var normals = try std.ArrayList(Vec3).initCapacity(allocator, 100);
+    defer normals.deinit(allocator);
+    var faces = try std.ArrayList(Face).initCapacity(allocator, 100);
+    defer faces.deinit(allocator);
+
+    // Parse line by line
+    var line_iter = std.mem.splitScalar(u8, contents, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        if (std.mem.startsWith(u8, trimmed, "v ")) {
+            try parseVertex(&vertices, trimmed, allocator);
+        } else if (std.mem.startsWith(u8, trimmed, "vn ")) {
+            try parseNormal(&normals, trimmed, allocator);
+        } else if (std.mem.startsWith(u8, trimmed, "f ")) {
+            try parseFace(&faces, trimmed, allocator);
+        }
+        // Ignore: vt (textures), mtllib, usemtl, s, o, g
+    }
+
+    return OBJData{
+        .vertices = try vertices.toOwnedSlice(allocator),
+        .normals = try normals.toOwnedSlice(allocator),
+        .faces = try faces.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+fn parseVertex(vertices: *std.ArrayList(Vec3), line: []const u8, allocator: std.mem.Allocator) !void {
+    // Format: "v x y z [w]" - ignore optional w
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    _ = iter.next(); // skip "v"
+
+    const x_str = iter.next() orelse return error.InvalidFormat;
+    const y_str = iter.next() orelse return error.InvalidFormat;
+    const z_str = iter.next() orelse return error.InvalidFormat;
+
+    const x = try std.fmt.parseFloat(f64, x_str);
+    const y = try std.fmt.parseFloat(f64, y_str);
+    const z = try std.fmt.parseFloat(f64, z_str);
+
+    try vertices.append(allocator, Vec3{ x, y, z });
+}
+
+fn parseNormal(normals: *std.ArrayList(Vec3), line: []const u8, allocator: std.mem.Allocator) !void {
+    // Format: "vn x y z"
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    _ = iter.next(); // skip "vn"
+
+    const x_str = iter.next() orelse return error.InvalidFormat;
+    const y_str = iter.next() orelse return error.InvalidFormat;
+    const z_str = iter.next() orelse return error.InvalidFormat;
+
+    const x = try std.fmt.parseFloat(f64, x_str);
+    const y = try std.fmt.parseFloat(f64, y_str);
+    const z = try std.fmt.parseFloat(f64, z_str);
+
+    try normals.append(allocator, Vec3{ x, y, z });
+}
+
+fn parseFace(faces: *std.ArrayList(Face), line: []const u8, allocator: std.mem.Allocator) !void {
+    // Parse face: "f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3" (or variations)
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    _ = iter.next(); // skip "f"
+
+    const vert1 = iter.next() orelse return error.InvalidFormat;
+    const vert2 = iter.next() orelse return error.InvalidFormat;
+    const vert3 = iter.next() orelse return error.InvalidFormat;
+
+    const v0_data = try parseVertexDescriptor(vert1);
+    const v1_data = try parseVertexDescriptor(vert2);
+    const v2_data = try parseVertexDescriptor(vert3);
+
+    try faces.append(allocator, Face{
+        .v0 = v0_data.v,
+        .v1 = v1_data.v,
+        .v2 = v2_data.v,
+        .n0 = v0_data.n,
+        .n1 = v1_data.n,
+        .n2 = v2_data.n,
+    });
+
+    // Triangulate if more than 3 vertices (simple fan from v0)
+    var prev = v2_data;
+    while (iter.next()) |vert| {
+        const curr = try parseVertexDescriptor(vert);
+        try faces.append(allocator, Face{
+            .v0 = v0_data.v,
+            .v1 = prev.v,
+            .v2 = curr.v,
+            .n0 = v0_data.n,
+            .n1 = prev.n,
+            .n2 = curr.n,
+        });
+        prev = curr;
+    }
+}
+
+fn parseVertexDescriptor(desc: []const u8) !VertexDescriptor {
+    // Format: "v/vt/vn" or "v//vn" or "v"
+    var iter = std.mem.splitScalar(u8, desc, '/');
+
+    // Vertex index (required, OBJ uses 1-based indexing)
+    const v_str = iter.next() orelse return error.InvalidFormat;
+    const v_index = try std.fmt.parseInt(i32, v_str, 10);
+    if (v_index <= 0) return error.InvalidIndex;
+
+    // Texture coord (optional, skip)
+    _ = iter.next();
+
+    // Normal index (optional)
+    var n_index: u32 = 0xFFFFFFFF; // sentinel for "not present"
+    if (iter.next()) |n_str| {
+        if (n_str.len > 0) {
+            const n = try std.fmt.parseInt(i32, n_str, 10);
+            if (n <= 0) return error.InvalidIndex;
+            n_index = @intCast(n - 1); // Convert to 0-based
+        }
+    }
+
+    return VertexDescriptor{
+        .v = @intCast(v_index - 1), // Convert to 0-based
+        .n = n_index,
+    };
+}
+
+// ============================================================================
+// Mesh - Collection of Triangles
+// ============================================================================
+
+const Mesh = struct {
+    triangles: []Triangle,
+    allocator: std.mem.Allocator,
+
+    pub fn fromOBJ(
+        allocator: std.mem.Allocator,
+        filepath: []const u8,
+        material: Material,
+    ) !Mesh {
+        const obj_data = try parseOBJ(allocator, filepath);
+        defer obj_data.deinit();
+
+        std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
+            obj_data.vertices.len,
+            obj_data.normals.len,
+            obj_data.faces.len,
+        });
+
+        // Validate indices
+        var has_normals_count: usize = 0;
+        for (obj_data.faces) |face| {
+            // Check vertex indices
+            if (face.v0 >= obj_data.vertices.len or
+                face.v1 >= obj_data.vertices.len or
+                face.v2 >= obj_data.vertices.len)
+            {
+                return error.InvalidIndex;
+            }
+
+            // Check normal indices if present
+            if (face.hasNormals()) {
+                has_normals_count += 1;
+                if (face.n0 >= obj_data.normals.len or
+                    face.n1 >= obj_data.normals.len or
+                    face.n2 >= obj_data.normals.len)
+                {
+                    return error.InvalidIndex;
+                }
+            }
+        }
+
+        const shading_type = if (has_normals_count == obj_data.faces.len)
+            "smooth"
+        else if (has_normals_count == 0)
+            "flat"
+        else
+            "mixed";
+
+        std.debug.print("Using {s} shading ({d}/{d} faces with normals)\n", .{
+            shading_type,
+            has_normals_count,
+            obj_data.faces.len,
+        });
+
+        // Create triangles
+        var triangles = try allocator.alloc(Triangle, obj_data.faces.len);
+        errdefer allocator.free(triangles);
+
+        for (obj_data.faces, 0..) |face, i| {
+            const v0 = obj_data.vertices[face.v0];
+            const v1 = obj_data.vertices[face.v1];
+            const v2 = obj_data.vertices[face.v2];
+
+            triangles[i] = if (face.hasNormals())
+                Triangle.initWithNormals(
+                    v0,
+                    v1,
+                    v2,
+                    obj_data.normals[face.n0],
+                    obj_data.normals[face.n1],
+                    obj_data.normals[face.n2],
+                    material,
+                )
+            else
+                Triangle.init(v0, v1, v2, material);
+        }
+
+        return Mesh{
+            .triangles = triangles,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: Mesh) void {
+        self.allocator.free(self.triangles);
+    }
+
+    /// Scale all vertices uniformly by a factor
+    pub fn scale(self: *Mesh, factor: f64) void {
+        for (self.triangles) |*tri| {
+            tri.v0 = mul(tri.v0, factor);
+            tri.v1 = mul(tri.v1, factor);
+            tri.v2 = mul(tri.v2, factor);
+            // Recompute edges
+            tri.edge1 = sub(tri.v1, tri.v0);
+            tri.edge2 = sub(tri.v2, tri.v0);
+        }
+    }
+
+    /// Translate all vertices by an offset
+    pub fn translate(self: *Mesh, offset: Vec3) void {
+        for (self.triangles) |*tri| {
+            tri.v0 = add(tri.v0, offset);
+            tri.v1 = add(tri.v1, offset);
+            tri.v2 = add(tri.v2, offset);
+            // Edges remain the same (translation doesn't affect them)
+        }
+    }
+
+    /// Rotate mesh around Y-axis by angle in degrees
+    pub fn rotateY(self: *Mesh, degrees: f64) void {
+        const radians = degrees * std.math.pi / 180.0;
+        const cos_theta = @cos(radians);
+        const sin_theta = @sin(radians);
+
+        for (self.triangles) |*tri| {
+            // Rotate vertices
+            tri.v0 = rotatePointY(tri.v0, cos_theta, sin_theta);
+            tri.v1 = rotatePointY(tri.v1, cos_theta, sin_theta);
+            tri.v2 = rotatePointY(tri.v2, cos_theta, sin_theta);
+
+            // Rotate normals if present
+            if (tri.has_normals) {
+                tri.n0 = rotatePointY(tri.n0, cos_theta, sin_theta);
+                tri.n1 = rotatePointY(tri.n1, cos_theta, sin_theta);
+                tri.n2 = rotatePointY(tri.n2, cos_theta, sin_theta);
+            }
+
+            // Recompute edges
+            tri.edge1 = sub(tri.v1, tri.v0);
+            tri.edge2 = sub(tri.v2, tri.v0);
+        }
+    }
+
+    /// Generate smooth vertex normals by averaging face normals
+    pub fn generateSmoothNormals(self: *Mesh, allocator: std.mem.Allocator) !void {
+        // HashMap to accumulate normals for each unique vertex position
+        var vertex_normals = std.AutoHashMap(Vec3Key, Vec3).init(allocator);
+        defer vertex_normals.deinit();
+
+        // First pass: accumulate face normals at each vertex
+        for (self.triangles) |*tri| {
+            // Compute face normal
+            const face_normal = unitVector(cross(tri.edge1, tri.edge2));
+
+            // Accumulate at each vertex
+            try accumulateNormal(&vertex_normals, tri.v0, face_normal);
+            try accumulateNormal(&vertex_normals, tri.v1, face_normal);
+            try accumulateNormal(&vertex_normals, tri.v2, face_normal);
+        }
+
+        // Second pass: assign averaged normals to triangles
+        for (self.triangles) |*tri| {
+            tri.n0 = unitVector(vertex_normals.get(Vec3Key.init(tri.v0)) orelse tri.n0);
+            tri.n1 = unitVector(vertex_normals.get(Vec3Key.init(tri.v1)) orelse tri.n1);
+            tri.n2 = unitVector(vertex_normals.get(Vec3Key.init(tri.v2)) orelse tri.n2);
+            tri.has_normals = true;
+        }
+
+        std.debug.print("Generated smooth normals for {d} triangles\n", .{self.triangles.len});
+    }
+};
+
+// Helper struct for using Vec3 as HashMap key
+const Vec3Key = struct {
+    x: u64,
+    y: u64,
+    z: u64,
+
+    pub fn init(v: Vec3) Vec3Key {
+        return Vec3Key{
+            .x = @bitCast(@as(f64, v[0])),
+            .y = @bitCast(@as(f64, v[1])),
+            .z = @bitCast(@as(f64, v[2])),
+        };
+    }
+};
+
+fn accumulateNormal(map: *std.AutoHashMap(Vec3Key, Vec3), vertex: Vec3, normal: Vec3) !void {
+    const key = Vec3Key.init(vertex);
+    const existing = map.get(key) orelse Vec3{ 0, 0, 0 };
+    try map.put(key, add(existing, normal));
+}
+
+fn rotatePointY(point: Vec3, cos_theta: f64, sin_theta: f64) Vec3 {
+    // Y-axis rotation matrix: [cos 0 sin; 0 1 0; -sin 0 cos]
+    return Vec3{
+        point[0] * cos_theta + point[2] * sin_theta,
+        point[1],
+        -point[0] * sin_theta + point[2] * cos_theta,
+    };
 }
 
 // ============================================================================
@@ -961,15 +1530,52 @@ pub fn main() !void {
     const scene_rng = scene_prng.random();
 
     // Build final scene with many random spheres
-    var sphere_list = try std.ArrayList(Sphere).initCapacity(allocator, 500);
-    defer sphere_list.deinit(allocator);
+    var primitive_list = try std.ArrayList(Primitive).initCapacity(allocator, 500);
+    defer primitive_list.deinit(allocator);
 
     // Ground
-    try sphere_list.append(allocator, Sphere.init(
-        Point3{ 0, -1000, 0 },
-        1000,
-        Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
-    ));
+    try primitive_list.append(allocator, Primitive{
+        .sphere = Sphere.init(
+            Point3{ 0, -1000, 0 },
+            1000,
+            Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
+        ),
+    });
+
+    // Load test cube mesh
+    const cube_mesh = try Mesh.fromOBJ(
+        allocator,
+        "models/test_cube.obj",
+        Material.lambertian(Color{ 0.8, 0.3, 0.3 }), // Red-ish
+    );
+    defer cube_mesh.deinit();
+
+    // Add cube triangles to scene
+    for (cube_mesh.triangles) |tri| {
+        try primitive_list.append(allocator, Primitive{ .triangle = tri });
+    }
+
+    // Load teapot mesh
+    var teapot_mesh = try Mesh.fromOBJ(
+        allocator,
+        "models/teapot.obj",
+        Material.dielectric(2.4), // Diamond (refractive index 2.4)
+    );
+    defer teapot_mesh.deinit();
+
+    // Generate smooth normals for better shading
+    try teapot_mesh.generateSmoothNormals(allocator);
+
+    // Transform teapot: rotate, scale, and position
+    // Rotate 30° around Y-axis, then scale and translate
+    teapot_mesh.rotateY(30.0);
+    teapot_mesh.scale(0.4);
+    teapot_mesh.translate(Vec3{ 2.3, 1.0, 2.95 });
+
+    // Add teapot triangles to scene
+    for (teapot_mesh.triangles) |tri| {
+        try primitive_list.append(allocator, Primitive{ .triangle = tri });
+    }
 
     // Random small spheres
     var a: i32 = -11;
@@ -991,7 +1597,7 @@ pub fn main() !void {
                         randomFloat(scene_rng) * randomFloat(scene_rng),
                         randomFloat(scene_rng) * randomFloat(scene_rng),
                     };
-                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.lambertian(albedo)));
+                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.lambertian(albedo)) });
                 } else if (choose_mat < 0.95) {
                     // Metal
                     const albedo = Color{
@@ -1000,40 +1606,41 @@ pub fn main() !void {
                         randomFloatRange(scene_rng, 0.5, 1.0),
                     };
                     const fuzz = randomFloatRange(scene_rng, 0.0, 0.5);
-                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.metal(albedo, fuzz)));
+                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.metal(albedo, fuzz)) });
                 } else {
                     // Glass
-                    try sphere_list.append(allocator, Sphere.init(center, 0.2, Material.dielectric(1.5)));
+                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.dielectric(1.5)) });
                 }
             }
         }
     }
 
     // Three large spheres
-    try sphere_list.append(allocator, Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)));
-    try sphere_list.append(allocator, Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })));
-    try sphere_list.append(allocator, Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)));
+    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)) });
+    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })) });
+    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)) });
 
     // Build BVH for efficient ray-object intersection
-    std.debug.print("Building BVH from {d} spheres...\n", .{sphere_list.items.len});
-    const world = try BVH.init(allocator, sphere_list.items);
+    std.debug.print("Building BVH from {d} primitives...\n", .{primitive_list.items.len});
+    const world = try BVH.init(allocator, primitive_list.items);
     defer world.deinit();
     std.debug.print("BVH built with {d} nodes\n", .{world.nodes.len});
 
-    // Camera setup - use lower resolution/samples for reasonable render time
-    // Final scene settings: width=1200, samples=500 (takes hours to render)
+    // Camera setup - quality controlled by build options
+    // Preview: -Dwidth=400 -Dsamples=10 (fast, ~5-10 seconds)
+    // Final: -Dwidth=1200 -Dsamples=500 (slow, ~minutes to hours)
     const camera = Camera.init(
         Point3{ 13, 2, 3 }, // lookfrom
         Point3{ 0, 0, 0 }, // lookat
         Vec3{ 0, 1, 0 }, // vup
         20.0, // vfov
         16.0 / 9.0, // aspect ratio
-        1200, // image width (use 1200 for final)
+        build_options.image_width, // Configurable via -Dwidth=N
         0.6, // defocus angle
         10.0, // focus distance
     );
 
-    const samples_per_pixel: u32 = 100; // Use 500 for final quality
+    const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
     const max_depth: i32 = 50;
 
     // Configuration (build-time constants from build.zig)

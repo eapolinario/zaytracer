@@ -1,5 +1,5 @@
-.PHONY: help build build-debug build-release \
-        run run-debug run-release run-both \
+.PHONY: help build build-debug build-release build-preview \
+        run run-debug run-release run-both preview \
         bench bench-debug bench-release bench-both clean test view view-debug view-release
 
 # Default target
@@ -7,6 +7,10 @@
 
 # Multithreading flag (can be overridden: make build MULTITHREAD=false)
 MULTITHREAD ?= true
+
+# Preview quality settings (fast iteration)
+PREVIEW_WIDTH ?= 400
+PREVIEW_SAMPLES ?= 10
 
 # Help message
 help:
@@ -16,12 +20,14 @@ help:
 	@echo "  make build              - Build in default mode (Debug, multithreaded)"
 	@echo "  make build-debug        - Build in Debug mode (with safety checks)"
 	@echo "  make build-release      - Build in ReleaseFast mode (optimized)"
+	@echo "  make build-preview      - Build for fast preview (400x225, 10 samples)"
 	@echo ""
 	@echo "Run targets:"
 	@echo "  make run                - Build and run in default mode"
 	@echo "  make run-debug          - Build and run in Debug mode"
 	@echo "  make run-release        - Build and run in ReleaseFast mode"
 	@echo "  make run-both           - Run both modes and save separate images"
+	@echo "  make preview            - FAST preview render (400x225, 10 samples) ⚡"
 	@echo ""
 	@echo "Benchmark targets:"
 	@echo "  make bench              - Compare Debug vs ReleaseFast performance"
@@ -58,6 +64,10 @@ build-release:
 	@echo "Building in ReleaseFast mode (multithreaded=$(MULTITHREAD))..."
 	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD)
 
+build-preview:
+	@echo "Building PREVIEW mode ($(PREVIEW_WIDTH)px, $(PREVIEW_SAMPLES) samples)..."
+	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD) -Dwidth=$(PREVIEW_WIDTH) -Dsamples=$(PREVIEW_SAMPLES)
+
 # Run targets
 run: run-debug
 
@@ -68,6 +78,18 @@ run-debug: build-debug
 run-release: build-release
 	@echo "Running ReleaseFast build..."
 	./zig-out/bin/zaytracer
+
+preview: build-preview
+	@echo "========================================="
+	@echo "   PREVIEW MODE (Fast Iteration)"
+	@echo "   Resolution: $(PREVIEW_WIDTH)x$$(echo "$(PREVIEW_WIDTH) / 16 * 9" | bc)"
+	@echo "   Samples: $(PREVIEW_SAMPLES)"
+	@echo "========================================="
+	@echo ""
+	./zig-out/bin/zaytracer
+	@echo ""
+	@echo "✓ Preview complete! Output: image.ppm"
+	@echo "  For final quality: make run-release"
 
 run-both: build-debug build-release
 	@echo "========================================="
