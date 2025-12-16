@@ -245,6 +245,40 @@ const Material = struct {
 };
 
 // ============================================================================
+// Light Sources
+// ============================================================================
+
+const LightType = enum {
+    point,
+};
+
+const Light = struct {
+    light_type: LightType,
+    position: Point3,
+    intensity: Color,
+    power: f64,
+
+    pub fn pointLight(position: Point3, intensity: Color, power: f64) Light {
+        return Light{
+            .light_type = .point,
+            .position = position,
+            .intensity = intensity,
+            .power = power,
+        };
+    }
+};
+
+// ============================================================================
+// Photon
+// ============================================================================
+
+const Photon = struct {
+    position: Point3,
+    direction: Vec3, // Incoming direction
+    power: Color, // RGB power/flux
+};
+
+// ============================================================================
 // Ray
 // ============================================================================
 
@@ -832,6 +866,232 @@ fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_off
 }
 
 // ============================================================================
+// Photon Map - Spatial Grid for Caustics
+// ============================================================================
+
+const PhotonMap = struct {
+    photons: []Photon,
+    allocator: std.mem.Allocator,
+    bounds_min: Point3,
+    bounds_max: Point3,
+    grid_size: u32,
+    grid_cells: []std.ArrayList(usize), // Each cell contains photon indices
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, bounds_min: Point3, bounds_max: Point3, grid_size: u32) !PhotonMap {
+        const photons = try allocator.alloc(Photon, capacity);
+        const num_cells = grid_size * grid_size * grid_size;
+        var grid_cells = try allocator.alloc(std.ArrayList(usize), num_cells);
+
+        for (0..num_cells) |i| {
+            grid_cells[i] = std.ArrayList(usize){};
+        }
+
+        return PhotonMap{
+            .photons = photons,
+            .allocator = allocator,
+            .bounds_min = bounds_min,
+            .bounds_max = bounds_max,
+            .grid_size = grid_size,
+            .grid_cells = grid_cells,
+        };
+    }
+
+    pub fn deinit(self: *PhotonMap) void {
+        for (self.grid_cells) |*cell| {
+            cell.deinit(self.allocator);
+        }
+        self.allocator.free(self.grid_cells);
+        self.allocator.free(self.photons);
+    }
+
+    pub fn buildGrid(self: *PhotonMap, photon_count: usize) !void {
+        // Clear existing grid
+        for (self.grid_cells) |*cell| {
+            cell.clearRetainingCapacity();
+        }
+
+        // Insert photons into grid cells
+        for (0..photon_count) |i| {
+            const photon = self.photons[i];
+            const cell_idx = self.getCellIndex(photon.position);
+            if (cell_idx) |idx| {
+                try self.grid_cells[idx].append(self.allocator, i);
+            }
+        }
+    }
+
+    fn getCellIndex(self: PhotonMap, pos: Point3) ?usize {
+        const extent = sub(self.bounds_max, self.bounds_min);
+        const rel_pos = sub(pos, self.bounds_min);
+
+        const grid_f = @as(f64, @floatFromInt(self.grid_size));
+        const ix = @as(i32, @intFromFloat((rel_pos[0] / extent[0]) * grid_f));
+        const iy = @as(i32, @intFromFloat((rel_pos[1] / extent[1]) * grid_f));
+        const iz = @as(i32, @intFromFloat((rel_pos[2] / extent[2]) * grid_f));
+
+        if (ix < 0 or ix >= self.grid_size or
+            iy < 0 or iy >= self.grid_size or
+            iz < 0 or iz >= self.grid_size)
+        {
+            return null;
+        }
+
+        const ux = @as(usize, @intCast(ix));
+        const uy = @as(usize, @intCast(iy));
+        const uz = @as(usize, @intCast(iz));
+
+        return ux + uy * self.grid_size + uz * self.grid_size * self.grid_size;
+    }
+
+    pub fn estimateRadiance(self: PhotonMap, pos: Point3, normal: Vec3, max_distance: f64) Color {
+        const cell_idx = self.getCellIndex(pos) orelse return Color{ 0, 0, 0 };
+
+        var radiance = Color{ 0, 0, 0 };
+        const max_dist_sq = max_distance * max_distance;
+        var photon_count: usize = 0;
+
+        // Search in current cell and neighboring cells
+        const cell_x = cell_idx % self.grid_size;
+        const cell_y = (cell_idx / self.grid_size) % self.grid_size;
+        const cell_z = cell_idx / (self.grid_size * self.grid_size);
+
+        var dz: i32 = -1;
+        while (dz <= 1) : (dz += 1) {
+            var dy: i32 = -1;
+            while (dy <= 1) : (dy += 1) {
+                var dx: i32 = -1;
+                while (dx <= 1) : (dx += 1) {
+                    const nx = @as(i32, @intCast(cell_x)) + dx;
+                    const ny = @as(i32, @intCast(cell_y)) + dy;
+                    const nz = @as(i32, @intCast(cell_z)) + dz;
+
+                    if (nx < 0 or nx >= self.grid_size or
+                        ny < 0 or ny >= self.grid_size or
+                        nz < 0 or nz >= self.grid_size)
+                    {
+                        continue;
+                    }
+
+                    const neighbor_idx = @as(usize, @intCast(nx)) +
+                        @as(usize, @intCast(ny)) * self.grid_size +
+                        @as(usize, @intCast(nz)) * self.grid_size * self.grid_size;
+
+                    for (self.grid_cells[neighbor_idx].items) |photon_idx| {
+                        const photon = self.photons[photon_idx];
+                        const diff = sub(photon.position, pos);
+                        const dist_sq = lengthSquared(diff);
+
+                        if (dist_sq < max_dist_sq) {
+                            // Check if photon is on the correct side (similar hemisphere)
+                            const cos_theta = dot(normal, neg(photon.direction));
+                            if (cos_theta > 0) {
+                                radiance = add(radiance, photon.power);
+                                photon_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (photon_count > 0) {
+            // Normalize by disk area (density estimation)
+            const area = std.math.pi * max_dist_sq;
+            return div(radiance, area);
+        }
+
+        return Color{ 0, 0, 0 };
+    }
+};
+
+// ============================================================================
+// Photon Tracing
+// ============================================================================
+
+fn tracePhoton(ray: Ray, world: BVH, depth: i32, power: Color, photons: []Photon, photon_count: *usize, max_photons: usize, rng: std.Random) void {
+    if (depth <= 0 or photon_count.* >= max_photons) return;
+
+    var rec: HitRecord = undefined;
+    if (!world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
+        return;
+    }
+
+    // For caustics, we only store photons on diffuse surfaces after specular bounces
+    // This is a simplified approach - in practice, you'd track specular path length
+
+    switch (rec.material.material_type) {
+        .lambertian => {
+            // Store photon on diffuse surface
+            if (photon_count.* < max_photons) {
+                photons[photon_count.*] = Photon{
+                    .position = rec.point,
+                    .direction = ray.direction,
+                    .power = power,
+                };
+                photon_count.* += 1;
+            }
+
+            // Russian roulette for photon continuation
+            if (depth > 3 and randomFloat(rng) > 0.5) return;
+
+            // Continue with diffuse bounce (for global illumination)
+            var scatter_direction = add(rec.normal, randomUnitVector(rng));
+            if (nearZero(scatter_direction)) {
+                scatter_direction = rec.normal;
+            }
+
+            const scattered = Ray.init(rec.point, scatter_direction);
+            const new_power = mulVec(power, rec.material.albedo);
+            tracePhoton(scattered, world, depth - 1, new_power, photons, photon_count, max_photons, rng);
+        },
+        .metal => {
+            // Reflect and continue (specular bounce for caustics)
+            const reflected = reflect(unitVector(ray.direction), rec.normal);
+            const scattered = Ray.init(rec.point, add(reflected, mul(randomInUnitSphere(rng), rec.material.fuzz)));
+
+            if (dot(scattered.direction, rec.normal) > 0) {
+                const new_power = mulVec(power, rec.material.albedo);
+                tracePhoton(scattered, world, depth - 1, new_power, photons, photon_count, max_photons, rng);
+            }
+        },
+        .dielectric => {
+            // Refract/reflect and continue (specular bounce for caustics)
+            const ri = if (rec.front_face) (1.0 / rec.material.refraction_index) else rec.material.refraction_index;
+            const unit_direction = unitVector(ray.direction);
+            const cos_theta = @min(dot(neg(unit_direction), rec.normal), 1.0);
+            const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
+
+            const cannot_refract = ri * sin_theta > 1.0;
+            const direction = if (cannot_refract or reflectance(cos_theta, ri) > randomFloat(rng))
+                reflect(unit_direction, rec.normal)
+            else
+                refract(unit_direction, rec.normal, ri);
+
+            const scattered = Ray.init(rec.point, direction);
+            // Dielectrics don't absorb light (for caustics)
+            tracePhoton(scattered, world, depth - 1, power, photons, photon_count, max_photons, rng);
+        },
+    }
+}
+
+fn emitPhotonsFromLight(light: Light, world: BVH, photon_map: *PhotonMap, num_photons: u32, rng: std.Random) !usize {
+    var photon_count: usize = 0;
+
+    for (0..num_photons) |_| {
+        // Generate random direction for photon emission
+        const direction = randomUnitVector(rng);
+
+        // Calculate photon power (distributed over hemisphere)
+        const photon_power = mul(light.intensity, light.power / @as(f64, @floatFromInt(num_photons)));
+
+        const ray = Ray.init(light.position, direction);
+        tracePhoton(ray, world, 5, photon_power, photon_map.photons, &photon_count, photon_map.photons.len, rng);
+    }
+
+    return photon_count;
+}
+
+// ============================================================================
 // OBJ File Parser
 // ============================================================================
 
@@ -1218,6 +1478,10 @@ fn rotatePointY(point: Vec3, cos_theta: f64, sin_theta: f64) Vec3 {
 // ============================================================================
 
 fn rayColor(ray: Ray, world: BVH, depth: i32, rng: std.Random) Color {
+    return rayColorWithPhotons(ray, world, depth, rng, null);
+}
+
+fn rayColorWithPhotons(ray: Ray, world: BVH, depth: i32, rng: std.Random, photon_map: ?*const PhotonMap) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
         return Color{ 0, 0, 0 };
@@ -1229,10 +1493,18 @@ fn rayColor(ray: Ray, world: BVH, depth: i32, rng: std.Random) Color {
         var scattered: Ray = undefined;
         var attenuation: Color = undefined;
 
-        if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
-            return mulVec(attenuation, rayColor(scattered, world, depth - 1, rng));
+        // Add caustics contribution for diffuse surfaces
+        var caustics_contribution = Color{ 0, 0, 0 };
+        if (rec.material.material_type == .lambertian and photon_map != null) {
+            // Query photon map for caustics
+            caustics_contribution = photon_map.?.estimateRadiance(rec.point, rec.normal, 0.3);
         }
-        return Color{ 0, 0, 0 };
+
+        if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
+            const indirect = rayColorWithPhotons(scattered, world, depth - 1, rng, photon_map);
+            return add(mulVec(attenuation, indirect), caustics_contribution);
+        }
+        return caustics_contribution;
     }
 
     // Create a gradient background from white to blue
@@ -1462,6 +1734,7 @@ const WorkerContext = struct {
     max_depth: i32,
     thread_id: u32,
     progress: *Progress,
+    photon_map: ?*const PhotonMap,
 };
 
 fn generateTiles(allocator: std.mem.Allocator, width: u32, height: u32, tile_size: u32) ![]Tile {
@@ -1503,7 +1776,7 @@ fn workerThread(ctx: *WorkerContext) void {
                 var sample: u32 = 0;
                 while (sample < ctx.samples_per_pixel) : (sample += 1) {
                     const ray = ctx.camera.getRay(x, y, rng);
-                    pixel_color = add(pixel_color, rayColor(ray, ctx.world.*, ctx.max_depth, rng));
+                    pixel_color = add(pixel_color, rayColorWithPhotons(ray, ctx.world.*, ctx.max_depth, rng, ctx.photon_map));
                 }
 
                 // Write to shared buffer (no race condition - each thread writes different tiles)
@@ -1626,6 +1899,34 @@ pub fn main() !void {
     defer world.deinit();
     std.debug.print("BVH built with {d} nodes\n", .{world.nodes.len});
 
+    // Create light source for caustics
+    const light = Light.pointLight(
+        Point3{ 5, 10, 5 }, // Position above and to the side
+        Color{ 1.0, 1.0, 1.0 }, // White light
+        1000.0, // Power
+    );
+
+    // Build photon map for caustics
+    std.debug.print("Building photon map for caustics...\n", .{});
+    var photon_map = try PhotonMap.init(
+        allocator,
+        100000, // Max 100k photons
+        Point3{ -15, -5, -15 }, // Scene bounds min
+        Point3{ 15, 15, 15 }, // Scene bounds max
+        50, // Grid size (50x50x50 = 125k cells)
+    );
+    defer photon_map.deinit();
+
+    // Emit photons from light
+    var photon_prng = std.Random.DefaultPrng.init(12345);
+    const photon_rng = photon_prng.random();
+    const photon_count = try emitPhotonsFromLight(light, world, &photon_map, 100000, photon_rng);
+    std.debug.print("Emitted and stored {d} photons\n", .{photon_count});
+
+    // Build spatial grid for fast photon queries
+    try photon_map.buildGrid(photon_count);
+    std.debug.print("Built photon spatial grid\n", .{});
+
     // Camera setup - quality controlled by build options
     // Preview: -Dwidth=400 -Dsamples=10 (fast, ~5-10 seconds)
     // Final: -Dwidth=1200 -Dsamples=500 (slow, ~minutes to hours)
@@ -1692,6 +1993,7 @@ pub fn main() !void {
                 .max_depth = max_depth,
                 .thread_id = @intCast(i),
                 .progress = &progress,
+                .photon_map = &photon_map,
             };
 
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{&contexts[i]});
@@ -1735,7 +2037,7 @@ pub fn main() !void {
                 var sample: u32 = 0;
                 while (sample < samples_per_pixel) : (sample += 1) {
                     const ray = camera.getRay(i, j, rng);
-                    pixel_color = add(pixel_color, rayColor(ray, world, max_depth, rng));
+                    pixel_color = add(pixel_color, rayColorWithPhotons(ray, world, max_depth, rng, &photon_map));
                 }
 
                 try writeColor(file, pixel_color, samples_per_pixel);
