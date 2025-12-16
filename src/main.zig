@@ -898,7 +898,7 @@ const PhotonMap = struct {
 
     pub fn deinit(self: *PhotonMap) void {
         for (self.grid_cells) |*cell| {
-            cell.deinit();
+            cell.deinit(self.allocator);
         }
         self.allocator.free(self.grid_cells);
         self.allocator.free(self.photons);
