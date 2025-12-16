@@ -883,7 +883,7 @@ const PhotonMap = struct {
         var grid_cells = try allocator.alloc(std.ArrayList(usize), num_cells);
 
         for (0..num_cells) |i| {
-            grid_cells[i] = std.ArrayList(usize).init(allocator);
+            grid_cells[i] = std.ArrayList(usize){};
         }
 
         return PhotonMap{
