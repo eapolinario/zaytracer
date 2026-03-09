@@ -17,6 +17,7 @@
           buildInputs = with pkgs; [
             zig
             zls  # Zig Language Server (optional, for IDE support)
+            nixd
           ];
 
           shellHook = ''
