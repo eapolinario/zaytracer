@@ -52,7 +52,7 @@ All options are compile-time and passed with `-D`:
 | `-Dwidth` | integer | `1200` | Image width in pixels |
 | `-Dsamples` | integer | `100` | Samples per pixel (antialiasing) |
 | `-Dmultithreading` | `true`/`false` | `true` | Tile-based multithreaded rendering |
-| `-Dio` | `threaded`, `single_threaded`, `evented` | `threaded` | Which `std.Io` implementation to use |
+| `-Dio` | `threaded`, `single_threaded`, `evented` | `threaded` | `std.Io` backend for file I/O and locking (not render parallelism) |
 
 ```bash
 # Fast preview
@@ -89,6 +89,27 @@ zig build run -Dio=single_threaded
 The Io implementation does not affect rendered output. With
 `-Dmultithreading=false` (deterministic), `threaded` and `single_threaded`
 produce byte-identical images.
+
+### `-Dio` vs `-Dmultithreading`
+
+These are independent knobs, and the names invite confusion:
+
+- **`-Dmultithreading`** controls **render parallelism**. The renderer spawns
+  workers directly with `std.Thread.spawn` and feeds them tiles from a shared
+  queue.
+- **`-Dio`** controls **which `std.Io` backend** services file I/O and
+  `Io.Mutex`. It does not start, stop, or size the render thread pool.
+
+In particular, `-Dio=single_threaded` does *not* make rendering
+single-threaded. With `-Dmultithreading=true` the renderer still uses every
+core; only I/O and locking go through the non-concurrent backend, which stays
+correct because `Io.Mutex` reaches the backend solely on the contended path
+and the underlying futex helpers are static.
+
+All four combinations are therefore valid. The renderer does not currently use
+`Io.async`/`Io.concurrent`; if it were ported to them, the Io implementation
+would decide how render tasks execute and `-Dio` would subsume
+`-Dmultithreading`.
 
 ## Viewing the Output
 
