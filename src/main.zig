@@ -1930,11 +1930,22 @@ const Mesh = struct {
         }
     }
 
-    /// The mesh's axis-aligned bounds.
+    /// The mesh's axis-aligned bounds, taken from the vertices themselves.
+    ///
+    /// Deliberately not a union of the triangles' bounding boxes: those are
+    /// padded by an epsilon so the BVH never sees a zero-thickness slab, and
+    /// placing a model with padded bounds would leave it hovering.
     pub fn bounds(self: Mesh) AABB {
         var box = AABB.empty;
         for (self.triangles) |tri| {
-            box = AABB.fromBoxes(box, tri.boundingBox());
+            inline for (.{ tri.v0, tri.v1, tri.v2 }) |v| {
+                box.x.min = @min(box.x.min, v[0]);
+                box.x.max = @max(box.x.max, v[0]);
+                box.y.min = @min(box.y.min, v[1]);
+                box.y.max = @max(box.y.max, v[1]);
+                box.z.min = @min(box.z.min, v[2]);
+                box.z.max = @max(box.z.max, v[2]);
+            }
         }
         return box;
     }
@@ -3297,4 +3308,224 @@ test "aiming emission redistributes the light power instead of adding energy" {
     var flux: f64 = 0;
     for (map.photons[0..stored]) |photon| flux += photon.power[0];
     try std.testing.expect(flux <= light.power * projection.sphereFraction() + 1e-9);
+}
+
+// ============================================================================
+// Tests - Scenes, Lights and Placement
+// ============================================================================
+
+test "the scene registry answers only for names it knows" {
+    try std.testing.expect(findScene("no-such-scene") == null);
+
+    // A typo here would break every run that does not pass --scene.
+    const fallback = findScene(default_scene_name);
+    try std.testing.expect(fallback != null);
+    try std.testing.expectEqualStrings(default_scene_name, fallback.?.name);
+
+    for (&scenes) |scene| {
+        try std.testing.expect(scene.name.len > 0);
+        try std.testing.expect(scene.description.len > 0);
+
+        const found = findScene(scene.name);
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualStrings(scene.name, found.?.name);
+    }
+}
+
+test "a light emits from one face and scatters nothing" {
+    const material = Material.diffuseLight(Color{ 1.0, 0.5, 0.25 }, 4.0);
+
+    try std.testing.expectEqual(Color{ 4.0, 2.0, 1.0 }, material.emitted(true));
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, material.emitted(false));
+
+    var prng = std.Random.DefaultPrng.init(1);
+    var scattered: Ray = undefined;
+    var attenuation: Color = undefined;
+    const rec = HitRecord{
+        .point = Point3{ 0, 0, 0 },
+        .normal = Vec3{ 0, 1, 0 },
+        .material = material,
+        .t = 1.0,
+        .front_face = true,
+    };
+    try std.testing.expect(!material.scatter(
+        Ray.init(Point3{ 0, 1, 0 }, Vec3{ 0, -1, 0 }),
+        rec,
+        &attenuation,
+        &scattered,
+        prng.random(),
+    ));
+}
+
+test "an area light is sampled from its front face and through nothing solid" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(5);
+    const rng = prng.random();
+
+    // Facing down: edge_u x edge_v points along -y.
+    const light = Light.quadLight(
+        Point3{ -1, 3, -1 },
+        Vec3{ 2, 0, 0 },
+        Vec3{ 0, 0, 2 },
+        Color{ 10, 10, 10 },
+    );
+    const albedo = Color{ 1, 1, 1 };
+
+    var nothing = [_]Primitive{};
+    const empty_world = try BVH.init(allocator, &nothing);
+    defer empty_world.deinit();
+
+    // Below it, facing up: lit.
+    const lit = light.sampleDirect(empty_world, Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, albedo, rng);
+    try std.testing.expect(lit[0] > 0.0);
+
+    // Above it, facing down. The lamp's back is dark, and it is the near-zero
+    // distance to a point just above the panel that makes this worth checking:
+    // the geometry term divides by the square of it.
+    const behind = light.sampleDirect(empty_world, Point3{ 0, 3.001, 0 }, Vec3{ 0, -1, 0 }, albedo, rng);
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, behind);
+
+    // Facing away from the light entirely.
+    const turned_away = light.sampleDirect(empty_world, Point3{ 0, 0, 0 }, Vec3{ 0, -1, 0 }, albedo, rng);
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, turned_away);
+
+    // With something in the way.
+    var blocker = [_]Primitive{
+        Primitive{ .sphere = Sphere.init(Point3{ 0, 1.5, 0 }, 0.5, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) },
+    };
+    const blocked_world = try BVH.init(allocator, &blocker);
+    defer blocked_world.deinit();
+
+    const blocked = light.sampleDirect(blocked_world, Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, albedo, rng);
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, blocked);
+}
+
+test "emission stops being counted once a path has touched a diffuse surface" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(9);
+    const rng = prng.random();
+
+    // A mirror on the floor with a lamp above it, so a ray aimed straight down
+    // reflects straight back up into the light. Metal with no fuzz makes the
+    // whole path deterministic.
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ 0, 1, 0 },
+        .lookat = Point3{ 0, 0, 0 },
+        .vfov = 40.0,
+    });
+    defer scene.deinit();
+
+    try scene.addQuad(
+        Point3{ -2, 0, -2 },
+        Vec3{ 4, 0, 0 },
+        Vec3{ 0, 0, 4 },
+        Material.metal(Color{ 1, 1, 1 }, 0.0),
+    );
+    try scene.addQuad(
+        Point3{ -2, 3, -2 },
+        Vec3{ 4, 0, 0 },
+        Vec3{ 0, 0, 4 },
+        Material.diffuseLight(Color{ 1, 1, 1 }, 6.0),
+    );
+
+    const world = try BVH.init(allocator, scene.primitives.items);
+    defer world.deinit();
+
+    var map = try PhotonMap.init(allocator, 1, Point3{ -4, -1, -4 }, Point3{ 4, 4, 4 }, 4);
+    defer map.deinit();
+
+    const down = Ray.init(Point3{ 0, 1, 0 }, Vec3{ 0, -1, 0 });
+    const with_map = RenderContext{
+        .world = world,
+        .background = .{ .solid = Color{ 0, 0, 0 } },
+        .photon_map = &map,
+    };
+
+    // Straight from the camera: the lamp's reflection is visible, and nothing
+    // else accounts for it.
+    const seen = rayColorInner(with_map, down, 8, rng, true);
+    try std.testing.expectApproxEqAbs(6.0, seen[0], 1e-9);
+
+    // The same path, but reached after a diffuse bounce. Direct sampling
+    // covered the lamp at that surface and the caustic map covers it arriving
+    // via the mirror, so counting it here would be the third time.
+    const already_accounted = rayColorInner(with_map, down, 8, rng, false);
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, already_accounted);
+
+    // Without a caustic map nothing else covers specular paths, so the
+    // renderer falls back to counting them: plain path tracing.
+    const path_traced = RenderContext{
+        .world = world,
+        .background = .{ .solid = Color{ 0, 0, 0 } },
+        .photon_map = null,
+    };
+    const counted = rayColorInner(path_traced, down, 8, rng, false);
+    try std.testing.expectApproxEqAbs(6.0, counted[0], 1e-9);
+}
+
+test "the photon grid ignores the ground sphere it stands on" {
+    const ground = Primitive{ .sphere = Sphere.init(Point3{ 0, -1000, 0 }, 1000, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) };
+    const glass = Primitive{ .sphere = Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)) };
+
+    var open_scene = [_]Primitive{ ground, glass };
+    const open_box = AABB.fromBoxes(ground.boundingBox(), glass.boundingBox());
+    const open = derivePhotonBounds(&open_scene, open_box);
+
+    // The scene is 2000 units across. Covering it would put every cell about
+    // 15 units wide against a gather radius of 0.2.
+    inline for (0..3) |axis| {
+        try std.testing.expect(open.max[axis] - open.min[axis] <= min_photon_extent + 1e-9);
+    }
+
+    // The glass has to be inside it, or its caustic never lands anywhere.
+    try std.testing.expect(open.min[1] <= 0.0 and open.max[1] >= 2.0);
+    try std.testing.expect(open.min[0] <= -1.0 and open.max[0] >= 1.0);
+
+    // A scene small enough to cover entirely should be covered entirely, walls
+    // and all: caustics in a closed room land well above the floor.
+    var room = [_]Primitive{
+        Primitive{ .sphere = Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)) },
+        Primitive{ .triangle = Triangle.init(Point3{ -3, 0, -3 }, Point3{ 3, 0, -3 }, Point3{ 3, 6, -3 }, Material.lambertian(Color{ 0.7, 0.7, 0.7 })) },
+    };
+    var room_box = AABB.empty;
+    for (room) |prim| room_box = AABB.fromBoxes(room_box, prim.boundingBox());
+
+    const closed = derivePhotonBounds(&room, room_box);
+    inline for (0..3) |axis| {
+        try std.testing.expectApproxEqAbs(room_box.axis(axis).min, closed.min[axis], 1e-9);
+        try std.testing.expectApproxEqAbs(room_box.axis(axis).max, closed.max[axis], 1e-9);
+    }
+}
+
+test "a fitted mesh lands where it was asked to" {
+    const allocator = std.testing.allocator;
+
+    const triangles = try allocator.alloc(Triangle, 1);
+    triangles[0] = Triangle.init(
+        Point3{ 100, 50, 20 },
+        Point3{ 110, 50, 20 },
+        Point3{ 100, 54, 20 },
+        Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
+    );
+    var mesh = Mesh{ .triangles = triangles, .allocator = allocator };
+    defer mesh.deinit();
+
+    // Longest side is 10, so fitting it to 5 halves the mesh.
+    mesh.fitTo(Point3{ 1, 2, 3 }, 5.0);
+
+    var box = mesh.bounds();
+    try std.testing.expectApproxEqAbs(5.0, box.x.size(), 1e-9);
+    try std.testing.expectApproxEqAbs(2.0, box.y.size(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, (box.x.min + box.x.max) / 2.0, 1e-9);
+    try std.testing.expectApproxEqAbs(2.0, (box.y.min + box.y.max) / 2.0, 1e-9);
+    try std.testing.expectApproxEqAbs(3.0, (box.z.min + box.z.max) / 2.0, 1e-9);
+
+    mesh.placeOnGround(0.0);
+    box = mesh.bounds();
+    try std.testing.expectApproxEqAbs(0.0, box.y.min, 1e-9);
+    try std.testing.expectApproxEqAbs(2.0, box.y.max, 1e-9);
+
+    // Sitting it on the floor must not have resized or slid it sideways.
+    try std.testing.expectApproxEqAbs(5.0, box.x.size(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, (box.x.min + box.x.max) / 2.0, 1e-9);
 }
