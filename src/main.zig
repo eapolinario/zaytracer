@@ -56,12 +56,28 @@ fn checkEventedSupported() void {
     if (std.Io.Evented == void) @compileError(
         "-Dio=evented is not supported on this target; use -Dio=threaded",
     );
-    const uring_fixed: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 1 };
-    if (std.Io.Evented == std.Io.Uring and builtin.zig_version.order(uring_fixed) == .lt) @compileError(
-        "-Dio=evented is broken in Zig 0.16.0: std.Io.Uring itself fails to compile because " ++
-            "error.ReadOnlyFileSystem is missing from Dir.OpenError and Dir.RealPathFileError. " ++
-            "This is an upstream standard library bug, not a zaytracer bug. Use -Dio=threaded.",
-    );
+    // Zig 0.16.0 ships a std.Io.Uring that cannot compile at all: it lets
+    // error.ReadOnlyFileSystem escape dirOpenDir and dirRealPathFile, which are
+    // declared to return Dir.OpenError and Dir.RealPathFileError respectively.
+    //
+    // Upstream bug:  https://codeberg.org/ziglang/zig/issues/32023
+    //                (duplicate of https://codeberg.org/ziglang/zig/issues/31828)
+    // Fixed by:      https://codeberg.org/ziglang/zig/pulls/31764, merged to
+    //                master on 2026-05-27, after 0.16.0 was tagged.
+    //
+    // Guarded on exactly 0.16.0: it is the only released version verified to be
+    // affected, and master already carries the fix. `Uring` is looked up with
+    // `@hasDecl` because master renamed the file to `IoUring.zig`.
+    if (@hasDecl(std.Io, "Uring")) {
+        const broken_release: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
+        if (std.Io.Evented == std.Io.Uring and builtin.zig_version.order(broken_release) == .eq) @compileError(
+            "-Dio=evented does not compile on Zig 0.16.0: std.Io.Uring lets " ++
+                "error.ReadOnlyFileSystem escape Dir.OpenError and Dir.RealPathFileError. " ++
+                "This is an upstream standard library bug, not a zaytracer bug: " ++
+                "https://codeberg.org/ziglang/zig/issues/32023 (fixed on master by PR 31764). " ++
+                "Use -Dio=threaded on this compiler.",
+        );
+    }
 }
 
 // ============================================================================

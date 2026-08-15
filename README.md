@@ -75,10 +75,16 @@ zig build run -Dio=single_threaded
   support, but blocking file I/O and the futex-based `Io.Mutex` still work, so
   it remains correct even with `-Dmultithreading=true`.
 - **`evented`** — `std.Io.Evented` (io_uring on Linux, kqueue on BSD, Dispatch
-  on Darwin). **Does not compile on Zig 0.16.0** due to an upstream bug where
-  `error.ReadOnlyFileSystem` is missing from `Dir.OpenError` and
-  `Dir.RealPathFileError` in `std.Io.Uring`. Selecting it produces an explicit
-  error explaining this rather than confusing standard library errors.
+  on Darwin). **Does not compile on Zig 0.16.0**: `std.Io.Uring` lets
+  `error.ReadOnlyFileSystem` escape `dirOpenDir` and `dirRealPathFile`, whose
+  declared error sets (`Dir.OpenError`, `Dir.RealPathFileError`) do not include
+  it. This is an upstream standard library bug, tracked as
+  [ziglang/zig#32023](https://codeberg.org/ziglang/zig/issues/32023) (duplicate
+  of [#31828](https://codeberg.org/ziglang/zig/issues/31828)) and fixed on
+  master by [PR #31764](https://codeberg.org/ziglang/zig/pulls/31764), merged
+  after 0.16.0 was tagged. Selecting it on 0.16.0 produces an explicit error
+  naming the upstream issue rather than confusing standard library errors.
+  Note that Zig's issue tracker lives on Codeberg, not GitHub.
 
 The Io implementation does not affect rendered output. With
 `-Dmultithreading=false` (deterministic), `threaded` and `single_threaded`
