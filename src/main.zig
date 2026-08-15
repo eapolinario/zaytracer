@@ -1,5 +1,84 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
+
+// ============================================================================
+// Io Backend
+// ============================================================================
+
+/// The `std.Io` implementation is chosen at build time via `-Dio=`.
+///
+/// * `threaded`        - thread pool backed, supports concurrency (default)
+/// * `single_threaded` - no concurrency support; `Io.async`/`Io.concurrent`
+///                       are unavailable, but blocking file I/O and the
+///                       futex-based `Io.Mutex` still work
+/// * `evented`         - io_uring on Linux, kqueue on BSD, Dispatch on Darwin
+const IoBackend = switch (build_options.io_impl) {
+    .threaded, .single_threaded => struct {
+        state: std.Io.Threaded,
+
+        fn init(self: *@This(), gpa: std.mem.Allocator) !void {
+            self.state = switch (build_options.io_impl) {
+                .threaded => .init(gpa, .{}),
+                else => .init_single_threaded,
+            };
+        }
+
+        fn io(self: *@This()) std.Io {
+            return self.state.io();
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinit();
+        }
+    },
+    .evented => struct {
+        state: std.Io.Evented,
+
+        fn init(self: *@This(), gpa: std.mem.Allocator) !void {
+            comptime checkEventedSupported();
+            try self.state.init(gpa, .{});
+        }
+
+        fn io(self: *@This()) std.Io {
+            return self.state.io();
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinit();
+        }
+    },
+};
+
+/// `std.Io.Evented` is not usable everywhere. Fail with an actionable message
+/// instead of letting the standard library produce confusing errors.
+fn checkEventedSupported() void {
+    if (std.Io.Evented == void) @compileError(
+        "-Dio=evented is not supported on this target; use -Dio=threaded",
+    );
+    // Zig 0.16.0 ships a std.Io.Uring that cannot compile at all: it lets
+    // error.ReadOnlyFileSystem escape dirOpenDir and dirRealPathFile, which are
+    // declared to return Dir.OpenError and Dir.RealPathFileError respectively.
+    //
+    // Upstream bug:  https://codeberg.org/ziglang/zig/issues/32023
+    //                (duplicate of https://codeberg.org/ziglang/zig/issues/31828)
+    // Fixed by:      https://codeberg.org/ziglang/zig/pulls/31764, merged to
+    //                master on 2026-05-27, after 0.16.0 was tagged.
+    //
+    // Guarded on exactly 0.16.0: it is the only released version verified to be
+    // affected, and master already carries the fix. `Uring` is looked up with
+    // `@hasDecl` because master renamed the file to `IoUring.zig`.
+    if (@hasDecl(std.Io, "Uring")) {
+        const broken_release: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
+        if (std.Io.Evented == std.Io.Uring and builtin.zig_version.order(broken_release) == .eq) @compileError(
+            "-Dio=evented does not compile on Zig 0.16.0: std.Io.Uring lets " ++
+                "error.ReadOnlyFileSystem escape Dir.OpenError and Dir.RealPathFileError. " ++
+                "This is an upstream standard library bug, not a zaytracer bug: " ++
+                "https://codeberg.org/ziglang/zig/issues/32023 (fixed on master by PR 31764). " ++
+                "Use -Dio=threaded on this compiler.",
+        );
+    }
+}
 
 // ============================================================================
 // Math Utilities
@@ -846,7 +925,11 @@ fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_off
                 .sphere => |s| s.center,
                 .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0),
             };
-            return a_center[ctx.axis_idx] < b_center[ctx.axis_idx];
+            return switch (ctx.axis_idx) {
+                0 => a_center[0] < b_center[0],
+                1 => a_center[1] < b_center[1],
+                else => a_center[2] < b_center[2],
+            };
         }
     };
 
@@ -883,7 +966,7 @@ const PhotonMap = struct {
         var grid_cells = try allocator.alloc(std.ArrayList(usize), num_cells);
 
         for (0..num_cells) |i| {
-            grid_cells[i] = std.ArrayList(usize){};
+            grid_cells[i] = .empty;
         }
 
         return PhotonMap{
@@ -1099,7 +1182,7 @@ const OBJParseError = error{
     InvalidFormat,
     MissingData,
     InvalidIndex,
-} || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError;
+} || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.Reader.Error;
 
 const OBJData = struct {
     vertices: []Vec3,
@@ -1137,13 +1220,10 @@ const VertexDescriptor = struct {
     n: u32, // normal index (0-based or 0xFFFFFFFF)
 };
 
-fn parseOBJ(allocator: std.mem.Allocator, filepath: []const u8) !OBJData {
-    const file = try std.fs.cwd().openFile(filepath, .{});
-    defer file.close();
-
+fn parseOBJ(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !OBJData {
     // Read entire file (reasonable for small-medium meshes up to 50MB)
     const max_file_size = 50 * 1024 * 1024;
-    const contents = try file.readToEndAlloc(allocator, max_file_size);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
     defer allocator.free(contents);
 
     // Dynamic arrays for parsed data
@@ -1286,10 +1366,11 @@ const Mesh = struct {
 
     pub fn fromOBJ(
         allocator: std.mem.Allocator,
+        io: std.Io,
         filepath: []const u8,
         material: Material,
     ) !Mesh {
-        const obj_data = try parseOBJ(allocator, filepath);
+        const obj_data = try parseOBJ(allocator, io, filepath);
         defer obj_data.deinit();
 
         std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
@@ -1609,7 +1690,7 @@ const Camera = struct {
 // Color Utilities
 // ============================================================================
 
-fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
+fn writeColor(file: std.Io.File, io: std.Io, color: Color, samples_per_pixel: u32) !void {
     var r = color[0];
     var g = color[1];
     var b = color[2];
@@ -1632,7 +1713,7 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
 
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ ir, ig, ib });
-    _ = try file.writeAll(line);
+    try file.writeStreamingAll(io, line);
 }
 
 // ============================================================================
@@ -1697,13 +1778,15 @@ const PixelBuffer = struct {
 const Progress = struct {
     completed_tiles: std.atomic.Value(usize),
     total_tiles: usize,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
+    io: std.Io,
 
-    pub fn init(total_tiles: usize) Progress {
+    pub fn init(io: std.Io, total_tiles: usize) Progress {
         return Progress{
             .completed_tiles = std.atomic.Value(usize).init(0),
             .total_tiles = total_tiles,
-            .mutex = .{},
+            .mutex = .init,
+            .io = io,
         };
     }
 
@@ -1712,8 +1795,8 @@ const Progress = struct {
 
         // Print progress every 10 tiles to reduce output spam
         if (completed % 10 == 0 or completed == self.total_tiles) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const percentage = @as(f64, @floatFromInt(completed)) / @as(f64, @floatFromInt(self.total_tiles)) * 100.0;
             std.debug.print("\rProgress: {d:.1}% ({d}/{d} tiles) - Thread {d}    ", .{ percentage, completed, self.total_tiles, thread_id });
@@ -1794,9 +1877,14 @@ fn workerThread(ctx: *WorkerContext) void {
 // ============================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    var io_backend: IoBackend = undefined;
+    try io_backend.init(allocator);
+    defer io_backend.deinit();
+    const io = io_backend.io();
 
     // Random number generator for scene generation
     var scene_prng = std.Random.DefaultPrng.init(0);
@@ -1818,6 +1906,7 @@ pub fn main() !void {
     // Load test cube mesh
     const cube_mesh = try Mesh.fromOBJ(
         allocator,
+        io,
         "models/test_cube.obj",
         Material.lambertian(Color{ 0.8, 0.3, 0.3 }), // Red-ish
     );
@@ -1831,6 +1920,7 @@ pub fn main() !void {
     // Load teapot mesh
     var teapot_mesh = try Mesh.fromOBJ(
         allocator,
+        io,
         "models/teapot.obj",
         Material.dielectric(2.4), // Diamond (refractive index 2.4)
     );
@@ -1949,13 +2039,13 @@ pub fn main() !void {
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
-    const file = try std.fs.cwd().createFile("image.ppm", .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, "image.ppm", .{});
+    defer file.close(io);
 
     // Write PPM header
     var header_buf: [256]u8 = undefined;
     const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ camera.image_width, camera.image_height });
-    _ = try file.writeAll(header);
+    try file.writeStreamingAll(io, header);
 
     if (comptime use_multithreading) {
         // ===== MULTI-THREADED PATH =====
@@ -1969,7 +2059,7 @@ pub fn main() !void {
 
         // Create tile queue and progress tracker
         var tile_queue = TileQueue.init(tiles);
-        var progress = Progress.init(tiles.len);
+        var progress = Progress.init(io, tiles.len);
 
         // Create shared pixel buffer
         var pixel_buffer = try PixelBuffer.init(allocator, camera.image_width, camera.image_height);
@@ -2013,7 +2103,7 @@ pub fn main() !void {
             var x: u32 = 0;
             while (x < camera.image_width) : (x += 1) {
                 const color = pixel_buffer.get(x, y);
-                try writeColor(file, color, samples_per_pixel);
+                try writeColor(file, io, color, samples_per_pixel);
             }
         }
     } else {
@@ -2040,7 +2130,7 @@ pub fn main() !void {
                     pixel_color = add(pixel_color, rayColorWithPhotons(ray, world, max_depth, rng, &photon_map));
                 }
 
-                try writeColor(file, pixel_color, samples_per_pixel);
+                try writeColor(file, io, pixel_color, samples_per_pixel);
             }
         }
     }
