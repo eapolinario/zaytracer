@@ -1,5 +1,5 @@
 .PHONY: help build build-debug build-release build-preview \
-        run run-debug run-release run-both preview \
+        run run-debug run-release run-both preview scenes \
         bench bench-debug bench-release bench-both clean test png view
 
 # Default target
@@ -20,6 +20,11 @@ PREVIEW_SAMPLES ?= 10
 
 # Which render the png/view targets act on: image, image-debug or image-release
 IMAGE ?= image
+
+# Scene to render. Empty means the binary's default (the book cover scene).
+# List them with: make scenes
+SCENE ?=
+SCENE_ARG = $(if $(SCENE),--scene=$(SCENE),)
 
 # Help message
 help:
@@ -47,6 +52,7 @@ help:
 	@echo "Utility targets:"
 	@echo "  make clean              - Clean build artifacts and images"
 	@echo "  make test               - Run unit tests"
+	@echo "  make scenes             - List the available scenes"
 	@echo "  make png                - Convert an existing render to PNG"
 	@echo "  make view               - Convert to PNG and open in the image viewer"
 	@echo "  make help               - Show this help message"
@@ -59,10 +65,12 @@ help:
 	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
 	@echo "  IO=threaded|single_threaded|evented - std.Io implementation (default: threaded)"
 	@echo "  IMAGE=image|image-debug|image-release - render used by png/view (default: image)"
+	@echo "  SCENE=<name>            - Scene to render (default: cover). See 'make scenes'"
 	@echo "  Examples:"
 	@echo "    make build MULTITHREAD=false       # Single-threaded debug build"
 	@echo "    make run-release MULTITHREAD=false # Single-threaded release run"
 	@echo "    make preview IO=single_threaded    # Preview using the single-threaded Io"
+	@echo "    make preview SCENE=cornell-box     # Preview a different scene"
 	@echo "    make run view                      # Render, then open the result"
 	@echo "    make view IMAGE=image-release      # View an already-rendered image"
 
@@ -86,11 +94,11 @@ run: run-debug
 
 run-debug: build-debug
 	@echo "Running Debug build..."
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 
 run-release: build-release
 	@echo "Running ReleaseFast build..."
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 
 preview: build-preview
 	@echo "========================================="
@@ -99,7 +107,7 @@ preview: build-preview
 	@echo "   Samples: $(PREVIEW_SAMPLES)"
 	@echo "========================================="
 	@echo ""
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@echo ""
 	@echo "✓ Preview complete! Output: image.ppm"
 	@echo "  For final quality: make run-release"
@@ -111,13 +119,13 @@ run-both: build-debug build-release
 	@echo ""
 	@echo "Running Debug build..."
 	@rm -f image.ppm image-debug.ppm
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@mv image.ppm image-debug.ppm
 	@echo "✓ Debug output saved to: image-debug.ppm"
 	@echo ""
 	@echo "Running ReleaseFast build..."
 	@rm -f image.ppm image-release.ppm
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@mv image.ppm image-release.ppm
 	@echo "✓ Release output saved to: image-release.ppm"
 	@echo ""
@@ -131,13 +139,13 @@ run-both: build-debug build-release
 bench-debug: build-debug
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@echo ""
 
 bench-release: build-release
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@echo ""
 
 bench:
@@ -163,7 +171,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm image-debug.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@mv image.ppm image-debug.ppm
 	@echo "✓ Debug output saved to: image-debug.ppm"
 	@echo ""
@@ -171,7 +179,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm image-release.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@mv image.ppm image-release.ppm
 	@echo "✓ Release output saved to: image-release.ppm"
 	@echo ""
@@ -197,6 +205,10 @@ clean:
 # Run tests
 test:
 	zig build test
+
+# List the scenes the binary knows about
+scenes: build-debug
+	@./zig-out/bin/zaytracer --list-scenes
 
 # View image targets
 #

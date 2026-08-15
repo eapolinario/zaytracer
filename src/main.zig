@@ -1869,6 +1869,292 @@ const Camera = struct {
 };
 
 // ============================================================================
+// Scenes
+// ============================================================================
+
+/// A camera without the pixel grid attached. Scenes describe where to stand and
+/// what to look at; the resolution comes from the build options, so the two are
+/// kept apart until the render actually starts.
+const CameraSpec = struct {
+    lookfrom: Point3,
+    lookat: Point3,
+    vup: Vec3 = Vec3{ 0, 1, 0 },
+    /// Vertical field of view in degrees.
+    vfov: f64,
+    aspect_ratio: f64 = 16.0 / 9.0,
+    defocus_angle: f64 = 0.0,
+    focus_dist: f64 = 10.0,
+
+    pub fn toCamera(self: CameraSpec, image_width: u32) Camera {
+        return Camera.init(
+            self.lookfrom,
+            self.lookat,
+            self.vup,
+            self.vfov,
+            self.aspect_ratio,
+            image_width,
+            self.defocus_angle,
+            self.focus_dist,
+        );
+    }
+};
+
+/// Everything a render needs from a scene, and everything it has to free
+/// afterwards. Meshes are copied into `primitives` and released by the builder,
+/// so a 250k-triangle model is not held twice for the whole render.
+const SceneData = struct {
+    allocator: std.mem.Allocator,
+    primitives: std.ArrayList(Primitive),
+    lights: std.ArrayList(Light),
+    camera: CameraSpec,
+
+    pub fn init(allocator: std.mem.Allocator, camera: CameraSpec) SceneData {
+        return SceneData{
+            .allocator = allocator,
+            .primitives = .empty,
+            .lights = .empty,
+            .camera = camera,
+        };
+    }
+
+    pub fn deinit(self: *SceneData) void {
+        self.primitives.deinit(self.allocator);
+        self.lights.deinit(self.allocator);
+    }
+
+    pub fn addSphere(self: *SceneData, sphere: Sphere) !void {
+        try self.primitives.append(self.allocator, Primitive{ .sphere = sphere });
+    }
+
+    pub fn addLight(self: *SceneData, light: Light) !void {
+        try self.lights.append(self.allocator, light);
+    }
+
+    /// Copy a mesh's triangles into the scene. The mesh itself stays owned by
+    /// the caller, which is free to release it as soon as this returns.
+    pub fn addMesh(self: *SceneData, mesh: Mesh) !void {
+        try self.primitives.ensureUnusedCapacity(self.allocator, mesh.triangles.len);
+        for (mesh.triangles) |tri| {
+            self.primitives.appendAssumeCapacity(Primitive{ .triangle = tri });
+        }
+    }
+};
+
+const SceneBuildFn = *const fn (allocator: std.mem.Allocator, io: std.Io) anyerror!SceneData;
+
+const Scene = struct {
+    name: []const u8,
+    description: []const u8,
+    build: SceneBuildFn,
+};
+
+/// Rendered when `--scene` is not given. Must only use models committed to the
+/// repository, because CI renders it without running `make models`.
+const default_scene_name = "cover";
+
+const scenes = [_]Scene{
+    .{
+        .name = "cover",
+        .description = "Ray Tracing in One Weekend cover: random spheres, a diamond teapot and a cube",
+        .build = buildCoverScene,
+    },
+};
+
+fn findScene(name: []const u8) ?*const Scene {
+    for (&scenes) |*scene| {
+        if (std.mem.eql(u8, scene.name, name)) return scene;
+    }
+    return null;
+}
+
+fn buildCoverScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ 13, 2, 3 },
+        .lookat = Point3{ 0, 0, 0 },
+        .vfov = 20.0,
+        .defocus_angle = 0.6,
+        .focus_dist = 10.0,
+    });
+    errdefer scene.deinit();
+
+    try scene.primitives.ensureTotalCapacity(allocator, 500);
+
+    // Random number generator for scene generation
+    var scene_prng = std.Random.DefaultPrng.init(0);
+    const scene_rng = scene_prng.random();
+
+    // Ground
+    try scene.addSphere(Sphere.init(
+        Point3{ 0, -1000, 0 },
+        1000,
+        Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
+    ));
+
+    // Load test cube mesh
+    {
+        const cube_mesh = try Mesh.fromOBJ(
+            allocator,
+            io,
+            "models/test_cube.obj",
+            Material.lambertian(Color{ 0.8, 0.3, 0.3 }), // Red-ish
+        );
+        defer cube_mesh.deinit();
+
+        try scene.addMesh(cube_mesh);
+    }
+
+    // Load teapot mesh
+    {
+        var teapot_mesh = try Mesh.fromOBJ(
+            allocator,
+            io,
+            "models/teapot.obj",
+            Material.dielectric(2.4), // Diamond (refractive index 2.4)
+        );
+        defer teapot_mesh.deinit();
+
+        // Generate smooth normals for better shading
+        try teapot_mesh.generateSmoothNormals(allocator);
+
+        // Transform teapot: rotate, scale, and position
+        // Rotate 30° around Y-axis, then scale and translate
+        teapot_mesh.rotateY(30.0);
+        teapot_mesh.scale(0.4);
+        teapot_mesh.translate(Vec3{ 2.3, 1.0, 2.95 });
+
+        try scene.addMesh(teapot_mesh);
+    }
+
+    // Random small spheres
+    var a: i32 = -11;
+    while (a < 11) : (a += 1) {
+        var b: i32 = -11;
+        while (b < 11) : (b += 1) {
+            const choose_mat = randomFloat(scene_rng);
+            const center = Point3{
+                @as(f64, @floatFromInt(a)) + 0.9 * randomFloat(scene_rng),
+                0.2,
+                @as(f64, @floatFromInt(b)) + 0.9 * randomFloat(scene_rng),
+            };
+
+            if (length(sub(center, Point3{ 4, 0.2, 0 })) > 0.9) {
+                if (choose_mat < 0.8) {
+                    // Diffuse
+                    const albedo = Color{
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
+                        randomFloat(scene_rng) * randomFloat(scene_rng),
+                    };
+                    try scene.addSphere(Sphere.init(center, 0.2, Material.lambertian(albedo)));
+                } else if (choose_mat < 0.95) {
+                    // Metal
+                    const albedo = Color{
+                        randomFloatRange(scene_rng, 0.5, 1.0),
+                        randomFloatRange(scene_rng, 0.5, 1.0),
+                        randomFloatRange(scene_rng, 0.5, 1.0),
+                    };
+                    const fuzz = randomFloatRange(scene_rng, 0.0, 0.5);
+                    try scene.addSphere(Sphere.init(center, 0.2, Material.metal(albedo, fuzz)));
+                } else {
+                    // Glass
+                    try scene.addSphere(Sphere.init(center, 0.2, Material.dielectric(1.5)));
+                }
+            }
+        }
+    }
+
+    // Three large spheres
+    try scene.addSphere(Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)));
+    try scene.addSphere(Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })));
+    try scene.addSphere(Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)));
+
+    // Light source for caustics
+    try scene.addLight(Light.pointLight(
+        Point3{ 5, 10, 5 }, // Position above and to the side
+        Color{ 1.0, 1.0, 1.0 }, // White light
+        1000.0, // Power
+    ));
+
+    return scene;
+}
+
+// ============================================================================
+// Command Line
+// ============================================================================
+
+const CliArgs = struct {
+    scene: *const Scene,
+};
+
+/// Returns null when the program has already said everything it was asked to
+/// (`--help`, `--list-scenes`) and should exit successfully without rendering.
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !?CliArgs {
+    var it = try args.iterateAllocator(allocator);
+    defer it.deinit();
+    _ = it.skip(); // program name
+
+    var scene_name: []const u8 = default_scene_name;
+
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return null;
+        } else if (std.mem.eql(u8, arg, "--list-scenes")) {
+            printScenes();
+            return null;
+        } else if (std.mem.startsWith(u8, arg, "--scene=")) {
+            scene_name = arg["--scene=".len..];
+        } else if (std.mem.eql(u8, arg, "--scene")) {
+            scene_name = it.next() orelse {
+                std.debug.print("Error: --scene needs a scene name\n\n", .{});
+                printScenes();
+                return error.MissingSceneName;
+            };
+        } else {
+            std.debug.print("Error: unknown argument '{s}'\n\n", .{arg});
+            printUsage();
+            return error.UnknownArgument;
+        }
+    }
+
+    // The scene name borrows the iterator's buffer, but the scene it resolves
+    // to is a static entry in `scenes`, so nothing outlives `it`.
+    const scene = findScene(scene_name) orelse {
+        std.debug.print("Error: unknown scene '{s}'\n\n", .{scene_name});
+        printScenes();
+        return error.UnknownScene;
+    };
+
+    return CliArgs{ .scene = scene };
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\Usage: zaytracer [options]
+        \\
+        \\Renders a scene to image.ppm.
+        \\
+        \\Options:
+        \\  --scene=<name>   Scene to render (default: {s})
+        \\  --list-scenes    List the available scenes and exit
+        \\  -h, --help       Show this help and exit
+        \\
+        \\Image size, sample count, multithreading and the std.Io backend are
+        \\build options; see the README for -Dwidth, -Dsamples, -Dmultithreading
+        \\and -Dio.
+        \\
+    , .{default_scene_name});
+}
+
+fn printScenes() void {
+    std.debug.print("Available scenes:\n", .{});
+    for (&scenes) |scene| {
+        const marker = if (std.mem.eql(u8, scene.name, default_scene_name)) " (default)" else "";
+        std.debug.print("  {s}{s}\n      {s}\n", .{ scene.name, marker, scene.description });
+    }
+}
+
+// ============================================================================
 // Color Utilities
 // ============================================================================
 
@@ -2058,125 +2344,27 @@ fn workerThread(ctx: *WorkerContext) void {
 // Main
 // ============================================================================
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    const args = try parseArgs(allocator, init.args) orelse return;
 
     var io_backend: IoBackend = undefined;
     try io_backend.init(allocator);
     defer io_backend.deinit();
     const io = io_backend.io();
 
-    // Random number generator for scene generation
-    var scene_prng = std.Random.DefaultPrng.init(0);
-    const scene_rng = scene_prng.random();
-
-    // Build final scene with many random spheres
-    var primitive_list = try std.ArrayList(Primitive).initCapacity(allocator, 500);
-    defer primitive_list.deinit(allocator);
-
-    // Ground
-    try primitive_list.append(allocator, Primitive{
-        .sphere = Sphere.init(
-            Point3{ 0, -1000, 0 },
-            1000,
-            Material.lambertian(Color{ 0.5, 0.5, 0.5 }),
-        ),
-    });
-
-    // Load test cube mesh
-    const cube_mesh = try Mesh.fromOBJ(
-        allocator,
-        io,
-        "models/test_cube.obj",
-        Material.lambertian(Color{ 0.8, 0.3, 0.3 }), // Red-ish
-    );
-    defer cube_mesh.deinit();
-
-    // Add cube triangles to scene
-    for (cube_mesh.triangles) |tri| {
-        try primitive_list.append(allocator, Primitive{ .triangle = tri });
-    }
-
-    // Load teapot mesh
-    var teapot_mesh = try Mesh.fromOBJ(
-        allocator,
-        io,
-        "models/teapot.obj",
-        Material.dielectric(2.4), // Diamond (refractive index 2.4)
-    );
-    defer teapot_mesh.deinit();
-
-    // Generate smooth normals for better shading
-    try teapot_mesh.generateSmoothNormals(allocator);
-
-    // Transform teapot: rotate, scale, and position
-    // Rotate 30° around Y-axis, then scale and translate
-    teapot_mesh.rotateY(30.0);
-    teapot_mesh.scale(0.4);
-    teapot_mesh.translate(Vec3{ 2.3, 1.0, 2.95 });
-
-    // Add teapot triangles to scene
-    for (teapot_mesh.triangles) |tri| {
-        try primitive_list.append(allocator, Primitive{ .triangle = tri });
-    }
-
-    // Random small spheres
-    var a: i32 = -11;
-    while (a < 11) : (a += 1) {
-        var b: i32 = -11;
-        while (b < 11) : (b += 1) {
-            const choose_mat = randomFloat(scene_rng);
-            const center = Point3{
-                @as(f64, @floatFromInt(a)) + 0.9 * randomFloat(scene_rng),
-                0.2,
-                @as(f64, @floatFromInt(b)) + 0.9 * randomFloat(scene_rng),
-            };
-
-            if (length(sub(center, Point3{ 4, 0.2, 0 })) > 0.9) {
-                if (choose_mat < 0.8) {
-                    // Diffuse
-                    const albedo = Color{
-                        randomFloat(scene_rng) * randomFloat(scene_rng),
-                        randomFloat(scene_rng) * randomFloat(scene_rng),
-                        randomFloat(scene_rng) * randomFloat(scene_rng),
-                    };
-                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.lambertian(albedo)) });
-                } else if (choose_mat < 0.95) {
-                    // Metal
-                    const albedo = Color{
-                        randomFloatRange(scene_rng, 0.5, 1.0),
-                        randomFloatRange(scene_rng, 0.5, 1.0),
-                        randomFloatRange(scene_rng, 0.5, 1.0),
-                    };
-                    const fuzz = randomFloatRange(scene_rng, 0.0, 0.5);
-                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.metal(albedo, fuzz)) });
-                } else {
-                    // Glass
-                    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(center, 0.2, Material.dielectric(1.5)) });
-                }
-            }
-        }
-    }
-
-    // Three large spheres
-    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ 0, 1, 0 }, 1.0, Material.dielectric(1.5)) });
-    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ -4, 1, 0 }, 1.0, Material.lambertian(Color{ 0.4, 0.2, 0.1 })) });
-    try primitive_list.append(allocator, Primitive{ .sphere = Sphere.init(Point3{ 4, 1, 0 }, 1.0, Material.metal(Color{ 0.7, 0.6, 0.5 }, 0.0)) });
+    std.debug.print("Scene: {s}\n", .{args.scene.name});
+    var scene = try args.scene.build(allocator, io);
+    defer scene.deinit();
 
     // Build BVH for efficient ray-object intersection
-    std.debug.print("Building BVH from {d} primitives...\n", .{primitive_list.items.len});
-    const world = try BVH.init(allocator, primitive_list.items);
+    std.debug.print("Building BVH from {d} primitives...\n", .{scene.primitives.items.len});
+    const world = try BVH.init(allocator, scene.primitives.items);
     defer world.deinit();
     std.debug.print("BVH built with {d} nodes\n", .{world.nodes.len});
-
-    // Create light source for caustics
-    const light = Light.pointLight(
-        Point3{ 5, 10, 5 }, // Position above and to the side
-        Color{ 1.0, 1.0, 1.0 }, // White light
-        1000.0, // Power
-    );
 
     // Build photon map for caustics
     std.debug.print("Building photon map for caustics...\n", .{});
@@ -2193,38 +2381,40 @@ pub fn main() !void {
     var photon_prng = std.Random.DefaultPrng.init(12345);
     const photon_rng = photon_prng.random();
 
-    const projection = try ProjectionMap.init(allocator, light.position, world, photon_rng);
-    defer projection.deinit();
-    std.debug.print(
-        "Projection map: {d} of {d} directions reach specular geometry ({d:.2}% of the sphere)\n",
-        .{ projection.cells.len, ProjectionMap.cell_count, projection.sphereFraction() * 100.0 },
-    );
+    // Caustics are gathered from a single light: a scene with none simply
+    // renders without them.
+    if (scene.lights.items.len > 0) {
+        const light = scene.lights.items[0];
+        if (scene.lights.items.len > 1) {
+            std.debug.print("Note: {d} lights in scene, emitting photons from the first only\n", .{scene.lights.items.len});
+        }
 
-    const photon_count = emitPhotonsFromLight(light, world, &photon_map, photons_emitted, projection, photon_rng);
-    std.debug.print("Emitted {d} photons, stored {d} caustic photons\n", .{ photons_emitted, photon_count });
-    if (photon_count >= photon_map_capacity) {
-        // Emission stops once the map is full, so the remaining photons never
-        // get traced and the caustics are missing that share of the light.
-        std.debug.print("Warning: photon map hit its capacity of {d}; raise photon_map_capacity\n", .{photon_map_capacity});
+        const projection = try ProjectionMap.init(allocator, light.position, world, photon_rng);
+        defer projection.deinit();
+        std.debug.print(
+            "Projection map: {d} of {d} directions reach specular geometry ({d:.2}% of the sphere)\n",
+            .{ projection.cells.len, ProjectionMap.cell_count, projection.sphereFraction() * 100.0 },
+        );
+
+        const photon_count = emitPhotonsFromLight(light, world, &photon_map, photons_emitted, projection, photon_rng);
+        std.debug.print("Emitted {d} photons, stored {d} caustic photons\n", .{ photons_emitted, photon_count });
+        if (photon_count >= photon_map_capacity) {
+            // Emission stops once the map is full, so the remaining photons never
+            // get traced and the caustics are missing that share of the light.
+            std.debug.print("Warning: photon map hit its capacity of {d}; raise photon_map_capacity\n", .{photon_map_capacity});
+        }
+
+        // Build spatial grid for fast photon queries
+        try photon_map.buildGrid(photon_count);
+        std.debug.print("Built photon spatial grid\n", .{});
+    } else {
+        std.debug.print("Scene has no lights: skipping caustics\n", .{});
     }
 
-    // Build spatial grid for fast photon queries
-    try photon_map.buildGrid(photon_count);
-    std.debug.print("Built photon spatial grid\n", .{});
-
-    // Camera setup - quality controlled by build options
+    // Camera setup - scene chooses the framing, build options the quality
     // Preview: -Dwidth=400 -Dsamples=10 (fast, ~5-10 seconds)
     // Final: -Dwidth=1200 -Dsamples=500 (slow, ~minutes to hours)
-    const camera = Camera.init(
-        Point3{ 13, 2, 3 }, // lookfrom
-        Point3{ 0, 0, 0 }, // lookat
-        Vec3{ 0, 1, 0 }, // vup
-        20.0, // vfov
-        16.0 / 9.0, // aspect ratio
-        build_options.image_width, // Configurable via -Dwidth=N
-        0.6, // defocus angle
-        10.0, // focus distance
-    );
+    const camera = scene.camera.toCamera(build_options.image_width);
 
     const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
     const max_depth: i32 = 50;
