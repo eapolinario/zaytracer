@@ -249,6 +249,15 @@ const MaterialType = enum {
     dielectric,
 };
 
+/// Whether a material bends light along a single (possibly fuzzed) direction.
+/// A photon has to bounce off one of these before it can form a caustic.
+fn isSpecular(material_type: MaterialType) bool {
+    return switch (material_type) {
+        .lambertian => false,
+        .metal, .dielectric => true,
+    };
+}
+
 const Material = struct {
     material_type: MaterialType,
     albedo: Color,
@@ -952,6 +961,27 @@ fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_off
 // Photon Map - Spatial Grid for Caustics
 // ============================================================================
 
+// Caustic photon map tuning. The map only holds LS+D photons (see tracePhoton),
+// so the budget is spent on directions that can actually reach a specular
+// object and the gather radius can be small enough to keep caustics sharp.
+
+/// Photons emitted from the light before rendering.
+const photons_emitted: u32 = 1_000_000;
+/// Upper bound on how many LS+D photons the map can store. Only a fraction of
+/// the emitted photons complete such a path, so this is well below the number
+/// emitted.
+const photon_map_capacity: usize = 200_000;
+/// Cells per axis in the photon lookup grid. Sized so a cell is roughly the
+/// gather radius: too coarse and every gather walks thousands of photons.
+const photon_grid_size: u32 = 128;
+/// Bounces a photon may take before it is dropped. Only specular bounces
+/// continue a path, so this is a budget for reflections and refractions.
+const photon_max_bounces: i32 = 8;
+/// Radius of the disk searched when estimating caustic radiance. The estimate
+/// uses a fixed radius rather than a k-nearest-neighbour query, so this trades
+/// sharpness in the bright cores against noise in the sparse areas.
+const caustic_gather_radius: f64 = 0.2;
+
 const PhotonMap = struct {
     photons: []Photon,
     allocator: std.mem.Allocator,
@@ -1026,40 +1056,48 @@ const PhotonMap = struct {
         return ux + uy * self.grid_size + uz * self.grid_size * self.grid_size;
     }
 
-    pub fn estimateRadiance(self: PhotonMap, pos: Point3, normal: Vec3, max_distance: f64) Color {
-        const cell_idx = self.getCellIndex(pos) orelse return Color{ 0, 0, 0 };
+    /// Grid coordinates of `pos`, clamped to the grid. Used to walk the cells a
+    /// gather sphere actually overlaps.
+    fn cellCoordsClamped(self: PhotonMap, pos: Point3) [3]u32 {
+        const extent = sub(self.bounds_max, self.bounds_min);
+        const rel_pos = sub(pos, self.bounds_min);
+        const grid_f = @as(f64, @floatFromInt(self.grid_size));
 
-        var radiance = Color{ 0, 0, 0 };
+        var coords: [3]u32 = undefined;
+        inline for (0..3) |axis| {
+            const scaled = (rel_pos[axis] / extent[axis]) * grid_f;
+            coords[axis] = @intFromFloat(std.math.clamp(scaled, 0.0, grid_f - 1.0));
+        }
+        return coords;
+    }
+
+    pub fn estimateRadiance(self: PhotonMap, pos: Point3, normal: Vec3, albedo: Color, max_distance: f64) Color {
+        // Nothing was stored outside the mapped volume, so nothing to gather.
+        if (self.getCellIndex(pos) == null) return Color{ 0, 0, 0 };
+
+        var flux = Color{ 0, 0, 0 };
         const max_dist_sq = max_distance * max_distance;
         var photon_count: usize = 0;
 
-        // Search in current cell and neighboring cells
-        const cell_x = cell_idx % self.grid_size;
-        const cell_y = (cell_idx / self.grid_size) % self.grid_size;
-        const cell_z = cell_idx / (self.grid_size * self.grid_size);
+        // Walk every cell the gather sphere touches. The number of cells follows
+        // from the radius instead of being fixed at 3x3x3, so the gather stays
+        // correct when the radius is larger than a cell and cheap when it is
+        // smaller.
+        const radius_vec = Vec3{ max_distance, max_distance, max_distance };
+        const lo = self.cellCoordsClamped(sub(pos, radius_vec));
+        const hi = self.cellCoordsClamped(add(pos, radius_vec));
 
-        var dz: i32 = -1;
-        while (dz <= 1) : (dz += 1) {
-            var dy: i32 = -1;
-            while (dy <= 1) : (dy += 1) {
-                var dx: i32 = -1;
-                while (dx <= 1) : (dx += 1) {
-                    const nx = @as(i32, @intCast(cell_x)) + dx;
-                    const ny = @as(i32, @intCast(cell_y)) + dy;
-                    const nz = @as(i32, @intCast(cell_z)) + dz;
+        var iz = lo[2];
+        while (iz <= hi[2]) : (iz += 1) {
+            var iy = lo[1];
+            while (iy <= hi[1]) : (iy += 1) {
+                var ix = lo[0];
+                while (ix <= hi[0]) : (ix += 1) {
+                    const cell_idx = @as(usize, ix) +
+                        @as(usize, iy) * self.grid_size +
+                        @as(usize, iz) * self.grid_size * self.grid_size;
 
-                    if (nx < 0 or nx >= self.grid_size or
-                        ny < 0 or ny >= self.grid_size or
-                        nz < 0 or nz >= self.grid_size)
-                    {
-                        continue;
-                    }
-
-                    const neighbor_idx = @as(usize, @intCast(nx)) +
-                        @as(usize, @intCast(ny)) * self.grid_size +
-                        @as(usize, @intCast(nz)) * self.grid_size * self.grid_size;
-
-                    for (self.grid_cells[neighbor_idx].items) |photon_idx| {
+                    for (self.grid_cells[cell_idx].items) |photon_idx| {
                         const photon = self.photons[photon_idx];
                         const diff = sub(photon.position, pos);
                         const dist_sq = lengthSquared(diff);
@@ -1068,7 +1106,7 @@ const PhotonMap = struct {
                             // Check if photon is on the correct side (similar hemisphere)
                             const cos_theta = dot(normal, neg(photon.direction));
                             if (cos_theta > 0) {
-                                radiance = add(radiance, photon.power);
+                                flux = add(flux, photon.power);
                                 photon_count += 1;
                             }
                         }
@@ -1078,9 +1116,12 @@ const PhotonMap = struct {
         }
 
         if (photon_count > 0) {
-            // Normalize by disk area (density estimation)
+            // Density estimate: the flux landing on the gather disk, turned into
+            // reflected radiance by the surface BRDF. For a Lambertian surface
+            // that BRDF is albedo / pi, which is what tints a caustic with the
+            // colour of the surface it lands on.
             const area = std.math.pi * max_dist_sq;
-            return div(radiance, area);
+            return div(mulVec(flux, albedo), area * std.math.pi);
         }
 
         return Color{ 0, 0, 0 };
@@ -1091,7 +1132,31 @@ const PhotonMap = struct {
 // Photon Tracing
 // ============================================================================
 
-fn tracePhoton(ray: Ray, world: BVH, depth: i32, power: Color, photons: []Photon, photon_count: *usize, max_photons: usize, rng: std.Random) void {
+/// Trace a photon and store it where it lands on a diffuse surface *after* at
+/// least one specular bounce, i.e. on an `LS+D` path. Those paths are exactly
+/// the ones that form caustics, and they are the ones a plain path tracer is
+/// worst at finding.
+///
+/// A photon that reaches a diffuse surface directly (`LD`) is direct light, not
+/// a caustic. Storing it made this a global photon map whose energy was added
+/// on top of the path traced result, washing the scene out. The renderer has no
+/// direct-lighting term for the point light, so that energy is dropped rather
+/// than moved elsewhere: the lamp contributes caustics only, and everything
+/// else is lit by the sky.
+///
+/// The path also ends at the first diffuse hit: continuing it would record
+/// `LS+DD` indirect bounces, which is again not caustic energy.
+fn tracePhoton(
+    ray: Ray,
+    world: BVH,
+    depth: i32,
+    power: Color,
+    specular_bounces: u32,
+    photons: []Photon,
+    photon_count: *usize,
+    max_photons: usize,
+    rng: std.Random,
+) void {
     if (depth <= 0 or photon_count.* >= max_photons) return;
 
     var rec: HitRecord = undefined;
@@ -1099,33 +1164,18 @@ fn tracePhoton(ray: Ray, world: BVH, depth: i32, power: Color, photons: []Photon
         return;
     }
 
-    // For caustics, we only store photons on diffuse surfaces after specular bounces
-    // This is a simplified approach - in practice, you'd track specular path length
-
     switch (rec.material.material_type) {
         .lambertian => {
-            // Store photon on diffuse surface
-            if (photon_count.* < max_photons) {
-                photons[photon_count.*] = Photon{
-                    .position = rec.point,
-                    .direction = ray.direction,
-                    .power = power,
-                };
-                photon_count.* += 1;
-            }
+            // End of the path either way: only a photon that already bounced off
+            // a specular surface belongs in a caustic map.
+            if (specular_bounces == 0) return;
 
-            // Russian roulette for photon continuation
-            if (depth > 3 and randomFloat(rng) > 0.5) return;
-
-            // Continue with diffuse bounce (for global illumination)
-            var scatter_direction = add(rec.normal, randomUnitVector(rng));
-            if (nearZero(scatter_direction)) {
-                scatter_direction = rec.normal;
-            }
-
-            const scattered = Ray.init(rec.point, scatter_direction);
-            const new_power = mulVec(power, rec.material.albedo);
-            tracePhoton(scattered, world, depth - 1, new_power, photons, photon_count, max_photons, rng);
+            photons[photon_count.*] = Photon{
+                .position = rec.point,
+                .direction = ray.direction,
+                .power = power,
+            };
+            photon_count.* += 1;
         },
         .metal => {
             // Reflect and continue (specular bounce for caustics)
@@ -1134,7 +1184,7 @@ fn tracePhoton(ray: Ray, world: BVH, depth: i32, power: Color, photons: []Photon
 
             if (dot(scattered.direction, rec.normal) > 0) {
                 const new_power = mulVec(power, rec.material.albedo);
-                tracePhoton(scattered, world, depth - 1, new_power, photons, photon_count, max_photons, rng);
+                tracePhoton(scattered, world, depth - 1, new_power, specular_bounces + 1, photons, photon_count, max_photons, rng);
             }
         },
         .dielectric => {
@@ -1152,23 +1202,149 @@ fn tracePhoton(ray: Ray, world: BVH, depth: i32, power: Color, photons: []Photon
 
             const scattered = Ray.init(rec.point, direction);
             // Dielectrics don't absorb light (for caustics)
-            tracePhoton(scattered, world, depth - 1, power, photons, photon_count, max_photons, rng);
+            tracePhoton(scattered, world, depth - 1, power, specular_bounces + 1, photons, photon_count, max_photons, rng);
         },
     }
 }
 
-fn emitPhotonsFromLight(light: Light, world: BVH, photon_map: *PhotonMap, num_photons: u32, rng: std.Random) !usize {
+// ============================================================================
+// Projection Map - Where a Light Can See Specular Geometry
+// ============================================================================
+
+/// Coarse map of the emission directions around a light that reach specular
+/// geometry. Photons sent anywhere else can never complete an `LS+D` path, so
+/// aiming the budget at the marked directions turns a mostly wasted emission
+/// pass into one where nearly every photon has a chance to contribute.
+///
+/// Cells are uniform in (cos(theta), phi), so all of them subtend the same
+/// solid angle: a marked cell can be picked uniformly and the emitted fraction
+/// of the sphere is simply the marked fraction of the cells.
+const ProjectionMap = struct {
+    const theta_cells: usize = 64;
+    const phi_cells: usize = 128;
+    const cell_count: usize = theta_cells * phi_cells;
+    /// Directions probed per cell when deciding whether it sees specular
+    /// geometry. Probing is stochastic, so the marked set is dilated afterwards
+    /// to recover cells that only clip the edge of an object.
+    const probes_per_cell: usize = 16;
+
+    /// Indices of the cells worth emitting into.
+    cells: []u32,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, origin: Point3, world: BVH, rng: std.Random) !ProjectionMap {
+        const probed = try allocator.alloc(bool, cell_count);
+        defer allocator.free(probed);
+        @memset(probed, false);
+
+        var rec: HitRecord = undefined;
+        for (0..cell_count) |cell| {
+            for (0..probes_per_cell) |_| {
+                const ray = Ray.init(origin, sampleCell(cell, rng));
+                const hit = world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec);
+                if (hit and isSpecular(rec.material.material_type)) {
+                    probed[cell] = true;
+                    break;
+                }
+            }
+        }
+
+        // A cell is far coarser than most of the geometry, so grow the marked set
+        // by one cell in every direction. Emitting into a few extra directions
+        // only costs photons; missing a cell loses caustic energy.
+        var marked_count: usize = 0;
+        const marked = try allocator.alloc(bool, cell_count);
+        defer allocator.free(marked);
+        for (0..theta_cells) |i| {
+            for (0..phi_cells) |j| {
+                const cell = i * phi_cells + j;
+                marked[cell] = neighbourhoodProbed(probed, i, j);
+                if (marked[cell]) marked_count += 1;
+            }
+        }
+
+        const cells = try allocator.alloc(u32, marked_count);
+        var next: usize = 0;
+        for (marked, 0..) |is_marked, cell| {
+            if (is_marked) {
+                cells[next] = @intCast(cell);
+                next += 1;
+            }
+        }
+
+        return ProjectionMap{ .cells = cells, .allocator = allocator };
+    }
+
+    pub fn deinit(self: ProjectionMap) void {
+        self.allocator.free(self.cells);
+    }
+
+    fn neighbourhoodProbed(probed: []const bool, i: usize, j: usize) bool {
+        var di: isize = -1;
+        while (di <= 1) : (di += 1) {
+            const ni = @as(isize, @intCast(i)) + di;
+            if (ni < 0 or ni >= theta_cells) continue;
+
+            var dj: isize = -1;
+            while (dj <= 1) : (dj += 1) {
+                // Azimuth wraps around; polar angle does not.
+                const nj = @mod(@as(isize, @intCast(j)) + dj, @as(isize, phi_cells));
+                if (probed[@as(usize, @intCast(ni)) * phi_cells + @as(usize, @intCast(nj))]) return true;
+            }
+        }
+        return false;
+    }
+
+    /// A direction drawn uniformly from the solid angle of one cell.
+    fn sampleCell(cell: usize, rng: std.Random) Vec3 {
+        const i = @as(f64, @floatFromInt(cell / phi_cells));
+        const j = @as(f64, @floatFromInt(cell % phi_cells));
+
+        const cos_max = 1.0 - 2.0 * i / @as(f64, theta_cells);
+        const cos_min = 1.0 - 2.0 * (i + 1.0) / @as(f64, theta_cells);
+
+        const cos_theta = cos_min + (cos_max - cos_min) * randomFloat(rng);
+        const phi = 2.0 * std.math.pi * (j + randomFloat(rng)) / @as(f64, phi_cells);
+        const sin_theta = @sqrt(@max(0.0, 1.0 - cos_theta * cos_theta));
+
+        return Vec3{ sin_theta * @cos(phi), cos_theta, sin_theta * @sin(phi) };
+    }
+
+    /// Fraction of the whole sphere the marked cells cover. Photon power is
+    /// scaled by this, so restricting emission redistributes the light's power
+    /// instead of adding energy to the scene.
+    pub fn sphereFraction(self: ProjectionMap) f64 {
+        return @as(f64, @floatFromInt(self.cells.len)) / @as(f64, cell_count);
+    }
+
+    pub fn sampleDirection(self: ProjectionMap, rng: std.Random) Vec3 {
+        if (self.cells.len == 0) return randomUnitVector(rng);
+        return sampleCell(self.cells[rng.uintLessThan(usize, self.cells.len)], rng);
+    }
+};
+
+fn emitPhotonsFromLight(
+    light: Light,
+    world: BVH,
+    photon_map: *PhotonMap,
+    num_photons: u32,
+    projection: ProjectionMap,
+    rng: std.Random,
+) usize {
     var photon_count: usize = 0;
+    if (num_photons == 0) return 0;
+
+    // Emission is restricted to the projection map, so a photon stands for the
+    // light's power over that solid angle only: aiming the emission
+    // redistributes the light's power instead of adding energy to the scene.
+    // Without specular geometry there is nothing to aim at, and emission falls
+    // back to the whole sphere.
+    const emitted_fraction = if (projection.cells.len == 0) 1.0 else projection.sphereFraction();
+    const photon_power = mul(light.intensity, light.power * emitted_fraction / @as(f64, @floatFromInt(num_photons)));
 
     for (0..num_photons) |_| {
-        // Generate random direction for photon emission
-        const direction = randomUnitVector(rng);
-
-        // Calculate photon power (distributed over hemisphere)
-        const photon_power = mul(light.intensity, light.power / @as(f64, @floatFromInt(num_photons)));
-
-        const ray = Ray.init(light.position, direction);
-        tracePhoton(ray, world, 5, photon_power, photon_map.photons, &photon_count, photon_map.photons.len, rng);
+        const ray = Ray.init(light.position, projection.sampleDirection(rng));
+        tracePhoton(ray, world, photon_max_bounces, photon_power, 0, photon_map.photons, &photon_count, photon_map.photons.len, rng);
     }
 
     return photon_count;
@@ -1577,8 +1753,14 @@ fn rayColorWithPhotons(ray: Ray, world: BVH, depth: i32, rng: std.Random, photon
         // Add caustics contribution for diffuse surfaces
         var caustics_contribution = Color{ 0, 0, 0 };
         if (rec.material.material_type == .lambertian and photon_map != null) {
-            // Query photon map for caustics
-            caustics_contribution = photon_map.?.estimateRadiance(rec.point, rec.normal, 0.3);
+            // The map holds LS+D photons only, so this adds the caustics the
+            // recursive estimate below cannot find, and nothing it can.
+            caustics_contribution = photon_map.?.estimateRadiance(
+                rec.point,
+                rec.normal,
+                rec.material.albedo,
+                caustic_gather_radius,
+            );
         }
 
         if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
@@ -2000,18 +2182,31 @@ pub fn main() !void {
     std.debug.print("Building photon map for caustics...\n", .{});
     var photon_map = try PhotonMap.init(
         allocator,
-        100000, // Max 100k photons
+        photon_map_capacity,
         Point3{ -15, -5, -15 }, // Scene bounds min
         Point3{ 15, 15, 15 }, // Scene bounds max
-        50, // Grid size (50x50x50 = 125k cells)
+        photon_grid_size,
     );
     defer photon_map.deinit();
 
     // Emit photons from light
     var photon_prng = std.Random.DefaultPrng.init(12345);
     const photon_rng = photon_prng.random();
-    const photon_count = try emitPhotonsFromLight(light, world, &photon_map, 100000, photon_rng);
-    std.debug.print("Emitted and stored {d} photons\n", .{photon_count});
+
+    const projection = try ProjectionMap.init(allocator, light.position, world, photon_rng);
+    defer projection.deinit();
+    std.debug.print(
+        "Projection map: {d} of {d} directions reach specular geometry ({d:.2}% of the sphere)\n",
+        .{ projection.cells.len, ProjectionMap.cell_count, projection.sphereFraction() * 100.0 },
+    );
+
+    const photon_count = emitPhotonsFromLight(light, world, &photon_map, photons_emitted, projection, photon_rng);
+    std.debug.print("Emitted {d} photons, stored {d} caustic photons\n", .{ photons_emitted, photon_count });
+    if (photon_count >= photon_map_capacity) {
+        // Emission stops once the map is full, so the remaining photons never
+        // get traced and the caustics are missing that share of the light.
+        std.debug.print("Warning: photon map hit its capacity of {d}; raise photon_map_capacity\n", .{photon_map_capacity});
+    }
 
     // Build spatial grid for fast photon queries
     try photon_map.buildGrid(photon_count);
@@ -2136,4 +2331,172 @@ pub fn main() !void {
     }
 
     std.debug.print("\rDone.                 \n", .{});
+}
+
+// ============================================================================
+// Tests - Caustic Photon Mapping
+// ============================================================================
+
+test "projection map samples stay inside the cell they belong to" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+
+    const theta_f = @as(f64, ProjectionMap.theta_cells);
+    const phi_f = @as(f64, ProjectionMap.phi_cells);
+
+    for (0..ProjectionMap.cell_count) |cell| {
+        const dir = ProjectionMap.sampleCell(cell, rng);
+        try std.testing.expectApproxEqAbs(1.0, length(dir), 1e-9);
+
+        const i = @as(f64, @floatFromInt(cell / ProjectionMap.phi_cells));
+        const j = @as(f64, @floatFromInt(cell % ProjectionMap.phi_cells));
+
+        // Polar angle: cells are uniform in cos(theta), which is just dir.y.
+        try std.testing.expect(dir[1] <= 1.0 - 2.0 * i / theta_f + 1e-12);
+        try std.testing.expect(dir[1] >= 1.0 - 2.0 * (i + 1.0) / theta_f - 1e-12);
+
+        // Azimuth: atan2 returns (-pi, pi], so shift it into [0, 2pi).
+        var phi = std.math.atan2(dir[2], dir[0]);
+        if (phi < 0.0) phi += 2.0 * std.math.pi;
+        try std.testing.expect(phi >= 2.0 * std.math.pi * j / phi_f - 1e-9);
+        try std.testing.expect(phi <= 2.0 * std.math.pi * (j + 1.0) / phi_f + 1e-9);
+    }
+}
+
+test "projection map only marks directions that reach specular geometry" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+
+    var diffuse_only = [_]Primitive{
+        Primitive{ .sphere = Sphere.init(Point3{ 0, -1000, 0 }, 1000, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) },
+    };
+    const world_diffuse = try BVH.init(allocator, &diffuse_only);
+    defer world_diffuse.deinit();
+
+    const no_targets = try ProjectionMap.init(allocator, Point3{ 0, 5, 0 }, world_diffuse, rng);
+    defer no_targets.deinit();
+    try std.testing.expectEqual(@as(usize, 0), no_targets.cells.len);
+
+    var with_glass = [_]Primitive{
+        Primitive{ .sphere = Sphere.init(Point3{ 0, -1000, 0 }, 1000, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) },
+        Primitive{ .sphere = Sphere.init(Point3{ 0, 2, 0 }, 1.0, Material.dielectric(1.5)) },
+    };
+    const world_glass = try BVH.init(allocator, &with_glass);
+    defer world_glass.deinit();
+
+    const targets = try ProjectionMap.init(allocator, Point3{ 0, 5, 0 }, world_glass, rng);
+    defer targets.deinit();
+
+    // The sphere is straight below the light and covers a small part of the
+    // sphere of directions, so emission should be aimed at a small subset.
+    try std.testing.expect(targets.cells.len > 0);
+    try std.testing.expect(targets.sphereFraction() < 0.25);
+}
+
+test "photon map only stores photons that arrived via a specular bounce" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(3);
+    const rng = prng.random();
+
+    const ground = Primitive{ .sphere = Sphere.init(Point3{ 0, -1000, 0 }, 1000, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) };
+    const straight_down = Ray.init(Point3{ 0, 5, 0 }, Vec3{ 0, -1, 0 });
+    const power = Color{ 1, 1, 1 };
+
+    var photons: [64]Photon = undefined;
+
+    // L -> D only: the path tracer already accounts for this light, so the
+    // caustic map must stay empty.
+    var diffuse_only = [_]Primitive{ground};
+    const world_diffuse = try BVH.init(allocator, &diffuse_only);
+    defer world_diffuse.deinit();
+
+    var diffuse_count: usize = 0;
+    for (0..16) |_| {
+        tracePhoton(straight_down, world_diffuse, photon_max_bounces, power, 0, &photons, &diffuse_count, photons.len, rng);
+    }
+    try std.testing.expectEqual(@as(usize, 0), diffuse_count);
+
+    // L -> S -> D: the same ray now refracts through glass before landing on
+    // the ground, which is exactly what a caustic map should hold.
+    var with_glass = [_]Primitive{
+        ground,
+        Primitive{ .sphere = Sphere.init(Point3{ 0, 2, 0 }, 1.0, Material.dielectric(1.5)) },
+    };
+    const world_glass = try BVH.init(allocator, &with_glass);
+    defer world_glass.deinit();
+
+    var caustic_count: usize = 0;
+    for (0..16) |_| {
+        tracePhoton(straight_down, world_glass, photon_max_bounces, power, 0, &photons, &caustic_count, photons.len, rng);
+    }
+    try std.testing.expect(caustic_count > 0);
+
+    // Dielectrics do not absorb, so the stored photons carry the full power.
+    for (photons[0..caustic_count]) |photon| {
+        try std.testing.expectEqual(power, photon.power);
+    }
+}
+
+test "radiance estimate applies the lambertian brdf" {
+    const allocator = std.testing.allocator;
+
+    var map = try PhotonMap.init(allocator, 4, Point3{ -1, -1, -1 }, Point3{ 1, 1, 1 }, 4);
+    defer map.deinit();
+
+    const power = Color{ 0.5, 0.25, 0.125 };
+    map.photons[0] = Photon{ .position = Point3{ 0, 0, 0 }, .direction = Vec3{ 0, -1, 0 }, .power = power };
+    try map.buildGrid(1);
+
+    const radius = 0.2;
+    const albedo = Color{ 0.8, 0.4, 0.2 };
+    const estimate = map.estimateRadiance(Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, albedo, radius);
+
+    // Flux over the gather disk, turned into radiance by the BRDF (albedo / pi).
+    const expected = div(mulVec(power, albedo), std.math.pi * radius * radius * std.math.pi);
+    inline for (0..3) |channel| {
+        try std.testing.expectApproxEqRel(expected[channel], estimate[channel], 1e-12);
+    }
+
+    // The estimate is tinted by the surface: a grey surface reflects less of the
+    // red channel than a red one does.
+    const grey = map.estimateRadiance(Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, Color{ 0.5, 0.5, 0.5 }, radius);
+    const red = map.estimateRadiance(Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, Color{ 1.0, 0.1, 0.1 }, radius);
+    try std.testing.expect(red[0] > grey[0]);
+    try std.testing.expect(red[2] < grey[2]);
+
+    // A photon arriving from behind the surface is not part of the estimate.
+    const backside = map.estimateRadiance(Point3{ 0, 0, 0 }, Vec3{ 0, -1, 0 }, albedo, radius);
+    try std.testing.expectEqual(Color{ 0, 0, 0 }, backside);
+}
+
+test "aiming emission redistributes the light power instead of adding energy" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(5);
+    const rng = prng.random();
+
+    var primitives = [_]Primitive{
+        Primitive{ .sphere = Sphere.init(Point3{ 0, -1000, 0 }, 1000, Material.lambertian(Color{ 0.5, 0.5, 0.5 })) },
+        Primitive{ .sphere = Sphere.init(Point3{ 0, 2, 0 }, 1.0, Material.dielectric(1.5)) },
+    };
+    const world = try BVH.init(allocator, &primitives);
+    defer world.deinit();
+
+    const light = Light.pointLight(Point3{ 0, 5, 0 }, Color{ 1, 1, 1 }, 1000.0);
+
+    const projection = try ProjectionMap.init(allocator, light.position, world, rng);
+    defer projection.deinit();
+
+    var map = try PhotonMap.init(allocator, 4096, Point3{ -15, -5, -15 }, Point3{ 15, 15, 15 }, 32);
+    defer map.deinit();
+
+    const emitted: u32 = 4096;
+    const stored = emitPhotonsFromLight(light, world, &map, emitted, projection, rng);
+    try std.testing.expect(stored > 0);
+
+    // Every photon stands for the light's power over the aimed solid angle, so
+    // the flux stored can never exceed what the light emits into it.
+    var flux: f64 = 0;
+    for (map.photons[0..stored]) |photon| flux += photon.power[0];
+    try std.testing.expect(flux <= light.power * projection.sphereFraction() + 1e-9);
 }

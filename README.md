@@ -140,6 +140,30 @@ is a normal make rule, so re-viewing an unchanged render does not reconvert it.
 - Monolithic `main.zig` structure following the book's progression
 - Optimized with ReleaseFast for performance
 
+### Caustics
+
+Caustics come from a photon map built before rendering, on top of the path
+tracer rather than inside it:
+
+- Photons are emitted from the point light and stored where they land on a
+  diffuse surface *after* at least one specular bounce (an `LS+D` path). A
+  photon that reaches a diffuse surface directly is direct light rather than a
+  caustic, and is dropped: storing it made this a global photon map whose
+  energy was added on top of the path traced result. The renderer has no
+  direct-lighting term for the point light, so the lamp contributes caustics
+  only and everything else is lit by the sky.
+- Emission is aimed with a projection map — a coarse grid of directions around
+  the light that probes which ones reach specular geometry. Photon power is
+  scaled by the fraction of the sphere those directions cover, so aiming
+  redistributes the light's power without adding energy.
+- Gathering is a fixed-radius density estimate scaled by the Lambertian BRDF
+  (`albedo / pi`), so a caustic takes on the colour of the surface it lands on.
+
+The tuning constants (`photons_emitted`, `caustic_gather_radius`,
+`photon_grid_size`, ...) sit together above `PhotonMap` in `src/main.zig`. The
+photon pass is deterministic; multithreaded rendering is not, so use
+`-Dmultithreading=false` when comparing two renders.
+
 ## References
 
 - [Ray Tracing in One Weekend](https://raytracing.github.io/)
