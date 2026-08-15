@@ -1141,10 +1141,9 @@ const VertexDescriptor = struct {
     n: u32, // normal index (0-based or 0xFFFFFFFF)
 };
 
-fn parseOBJ(allocator: std.mem.Allocator, filepath: []const u8) !OBJData {
+fn parseOBJ(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !OBJData {
     // Read entire file (reasonable for small-medium meshes up to 50MB)
     const max_file_size = 50 * 1024 * 1024;
-    const io = std.Io.Threaded.global_single_threaded.io();
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
     defer allocator.free(contents);
 
@@ -1288,10 +1287,11 @@ const Mesh = struct {
 
     pub fn fromOBJ(
         allocator: std.mem.Allocator,
+        io: std.Io,
         filepath: []const u8,
         material: Material,
     ) !Mesh {
-        const obj_data = try parseOBJ(allocator, filepath);
+        const obj_data = try parseOBJ(allocator, io, filepath);
         defer obj_data.deinit();
 
         std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
@@ -1700,12 +1700,14 @@ const Progress = struct {
     completed_tiles: std.atomic.Value(usize),
     total_tiles: usize,
     mutex: std.Io.Mutex,
+    io: std.Io,
 
-    pub fn init(total_tiles: usize) Progress {
+    pub fn init(io: std.Io, total_tiles: usize) Progress {
         return Progress{
             .completed_tiles = std.atomic.Value(usize).init(0),
             .total_tiles = total_tiles,
             .mutex = .init,
+            .io = io,
         };
     }
 
@@ -1714,9 +1716,8 @@ const Progress = struct {
 
         // Print progress every 10 tiles to reduce output spam
         if (completed % 10 == 0 or completed == self.total_tiles) {
-            const io = std.Io.Threaded.global_single_threaded.io();
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const percentage = @as(f64, @floatFromInt(completed)) / @as(f64, @floatFromInt(self.total_tiles)) * 100.0;
             std.debug.print("\rProgress: {d:.1}% ({d}/{d} tiles) - Thread {d}    ", .{ percentage, completed, self.total_tiles, thread_id });
@@ -1801,6 +1802,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // Random number generator for scene generation
     var scene_prng = std.Random.DefaultPrng.init(0);
     const scene_rng = scene_prng.random();
@@ -1821,6 +1826,7 @@ pub fn main() !void {
     // Load test cube mesh
     const cube_mesh = try Mesh.fromOBJ(
         allocator,
+        io,
         "models/test_cube.obj",
         Material.lambertian(Color{ 0.8, 0.3, 0.3 }), // Red-ish
     );
@@ -1834,6 +1840,7 @@ pub fn main() !void {
     // Load teapot mesh
     var teapot_mesh = try Mesh.fromOBJ(
         allocator,
+        io,
         "models/teapot.obj",
         Material.dielectric(2.4), // Diamond (refractive index 2.4)
     );
@@ -1952,7 +1959,6 @@ pub fn main() !void {
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
-    const io = std.Io.Threaded.global_single_threaded.io();
     const file = try std.Io.Dir.cwd().createFile(io, "image.ppm", .{});
     defer file.close(io);
 
@@ -1973,7 +1979,7 @@ pub fn main() !void {
 
         // Create tile queue and progress tracker
         var tile_queue = TileQueue.init(tiles);
-        var progress = Progress.init(tiles.len);
+        var progress = Progress.init(io, tiles.len);
 
         // Create shared pixel buffer
         var pixel_buffer = try PixelBuffer.init(allocator, camera.image_width, camera.image_height);
