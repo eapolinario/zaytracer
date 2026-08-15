@@ -1,6 +1,7 @@
 .PHONY: help build build-debug build-release build-preview \
         run run-debug run-release run-both preview scenes \
-        bench bench-debug bench-release bench-both clean test png view
+        bench bench-debug bench-release bench-both clean test png view \
+        models models-verify
 
 # Default target
 .DEFAULT_GOAL := help
@@ -25,6 +26,11 @@ IMAGE ?= image
 # List them with: make scenes
 SCENE ?=
 SCENE_ARG = $(if $(SCENE),--scene=$(SCENE),)
+
+# Models that are fetched rather than committed
+MODELS_DIR := models
+MANIFEST := $(MODELS_DIR)/manifest.tsv
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
 
 # Help message
 help:
@@ -53,6 +59,8 @@ help:
 	@echo "  make clean              - Clean build artifacts and images"
 	@echo "  make test               - Run unit tests"
 	@echo "  make scenes             - List the available scenes"
+	@echo "  make models             - Fetch the models in models/manifest.tsv (sha256 verified)"
+	@echo "  make models-verify      - Re-check fetched models against the manifest"
 	@echo "  make png                - Convert an existing render to PNG"
 	@echo "  make view               - Convert to PNG and open in the image viewer"
 	@echo "  make help               - Show this help message"
@@ -205,6 +213,50 @@ clean:
 # Run tests
 test:
 	zig build test
+
+# Fetch the models listed in models/manifest.tsv that are not already present,
+# and verify each against its sha256 before putting it in place. Models large
+# enough to be worth fetching are too large to commit, and the Stanford-derived
+# ones are not ours to redistribute anyway.
+models:
+	@set -e; \
+	tab=$$(printf '\t'); \
+	while IFS="$$tab" read -r name url sum rest; do \
+		case "$$name" in ''|\#*) continue ;; esac; \
+		dest="$(MODELS_DIR)/$$name"; \
+		if [ -f "$$dest" ]; then echo "have   $$name"; continue; fi; \
+		if [ -z "$$url" ] || [ -z "$$sum" ]; then \
+			echo "Error: $(MANIFEST): entry '$$name' is missing a url or a sha256" >&2; exit 1; \
+		fi; \
+		echo "fetch  $$name"; \
+		curl -fL --progress-bar -o "$$dest.part" "$$url"; \
+		actual=$$($(SHA256) "$$dest.part" | cut -d' ' -f1); \
+		if [ "$$actual" != "$$sum" ]; then \
+			rm -f "$$dest.part"; \
+			echo "Error: $$name does not match its checksum" >&2; \
+			echo "  expected $$sum" >&2; \
+			echo "  actual   $$actual" >&2; \
+			exit 1; \
+		fi; \
+		mv "$$dest.part" "$$dest"; \
+		echo "ok     $$name"; \
+	done < $(MANIFEST)
+
+# Re-check the models already on disk against the manifest.
+models-verify:
+	@set -e; \
+	tab=$$(printf '\t'); \
+	missing=0; bad=0; \
+	while IFS="$$tab" read -r name url sum rest; do \
+		case "$$name" in ''|\#*) continue ;; esac; \
+		dest="$(MODELS_DIR)/$$name"; \
+		if [ ! -f "$$dest" ]; then echo "absent $$name"; missing=$$((missing+1)); continue; fi; \
+		actual=$$($(SHA256) "$$dest" | cut -d' ' -f1); \
+		if [ "$$actual" = "$$sum" ]; then echo "ok     $$name"; \
+		else echo "BAD    $$name ($$actual)"; bad=$$((bad+1)); fi; \
+	done < $(MANIFEST); \
+	if [ $$bad -gt 0 ]; then echo "$$bad model(s) failed verification" >&2; exit 1; fi; \
+	if [ $$missing -gt 0 ]; then echo "$$missing model(s) not fetched; run 'make models'"; fi
 
 # List the scenes the binary knows about
 scenes: build-debug
