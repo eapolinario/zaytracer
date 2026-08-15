@@ -751,6 +751,13 @@ const Primitive = union(enum) {
         };
     }
 
+    pub fn material(self: Primitive) Material {
+        return switch (self) {
+            .sphere => |s| s.material,
+            .triangle => |t| t.material,
+        };
+    }
+
     pub fn hit(self: Primitive, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
         return switch (self) {
             .sphere => |s| s.hit(ray, ray_t, rec),
@@ -981,6 +988,83 @@ const photon_max_bounces: i32 = 8;
 /// uses a fixed radius rather than a k-nearest-neighbour query, so this trades
 /// sharpness in the bright cores against noise in the sparse areas.
 const caustic_gather_radius: f64 = 0.2;
+/// Smallest world box, per axis, that the photon grid will cover. The grid is
+/// always `photon_grid_size` cells across whatever box it is given, so this
+/// doubles as the coarsest cell size the derivation will settle for: 32 units
+/// over 128 cells is 0.25, close to the gather radius.
+const min_photon_extent: f64 = 32.0;
+
+/// The slice of the world the photon grid covers. A photon that lands outside
+/// it is dropped, so getting this wrong costs caustics silently.
+const PhotonBounds = struct {
+    min: Point3,
+    max: Point3,
+
+    pub fn cellSize(self: PhotonBounds, grid_size: u32) Vec3 {
+        return div(sub(self.max, self.min), @floatFromInt(grid_size));
+    }
+};
+
+/// Work out which part of the world is worth covering with photon cells.
+///
+/// The scene's own bounding box is the wrong answer: the cover scene's ground
+/// is a sphere of radius 1000, so the box spans 2000 units, its centre sits 1000
+/// units underground, and every cell would be ~15 units across — hundreds of
+/// times the gather radius. Caustics only appear near the geometry that focuses
+/// them, so the box is anchored on the specular primitives, grown to at least
+/// `min_photon_extent` to cover the splash around them, and then clipped to the
+/// scene. It is never narrower than the specular geometry it has to hold.
+fn derivePhotonBounds(primitives: []const Primitive, scene_box: AABB) PhotonBounds {
+    if (primitives.len == 0) {
+        const half = min_photon_extent / 2.0;
+        return PhotonBounds{
+            .min = Point3{ -half, -half, -half },
+            .max = Point3{ half, half, half },
+        };
+    }
+
+    // Photons are only stored after a specular bounce, so those are the objects
+    // the grid has to be built around.
+    var anchor_box = AABB.empty;
+    var specular_count: usize = 0;
+    for (primitives) |prim| {
+        if (!isSpecular(prim.material().material_type)) continue;
+        anchor_box = AABB.fromBoxes(anchor_box, prim.boundingBox());
+        specular_count += 1;
+    }
+    if (specular_count == 0) anchor_box = scene_box;
+
+    var min: Point3 = undefined;
+    var max: Point3 = undefined;
+
+    inline for (0..3) |axis| {
+        const anchor = anchor_box.axis(axis);
+        const scene = scene_box.axis(axis);
+        const center = (anchor.min + anchor.max) / 2.0;
+        const room = scene.size();
+        const bounded = room > 0.0 and std.math.isFinite(room);
+
+        const size = if (bounded) @min(@max(anchor.size(), min_photon_extent), room) else min_photon_extent;
+
+        var lo = center - size / 2.0;
+        var hi = center + size / 2.0;
+
+        // Clip to the scene rather than sliding the window back inside it. The
+        // window is centred on the specular geometry and never narrower, so
+        // clipping cannot cut any of it off, and it keeps the box from
+        // stretching tens of units into the empty space under a ground sphere
+        // just to preserve a nominal extent.
+        if (bounded) {
+            lo = @max(lo, scene.min);
+            hi = @min(hi, scene.max);
+        }
+
+        min[axis] = lo;
+        max[axis] = hi;
+    }
+
+    return PhotonBounds{ .min = min, .max = max };
+}
 
 const PhotonMap = struct {
     photons: []Photon,
@@ -1024,12 +1108,26 @@ const PhotonMap = struct {
         }
 
         // Insert photons into grid cells
+        var dropped: usize = 0;
         for (0..photon_count) |i| {
             const photon = self.photons[i];
             const cell_idx = self.getCellIndex(photon.position);
             if (cell_idx) |idx| {
                 try self.grid_cells[idx].append(self.allocator, i);
+            } else {
+                // A photon outside the grid contributes to nothing. Losing a
+                // few is harmless, but losing a scene's worth is the difference
+                // between "no caustics here" and "the bounds are wrong", and
+                // that should not be silent.
+                dropped += 1;
             }
+        }
+
+        if (dropped > 0) {
+            std.debug.print(
+                "Warning: {d} of {d} photons landed outside the photon grid and were dropped\n",
+                .{ dropped, photon_count },
+            );
         }
     }
 
@@ -2368,11 +2466,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Build photon map for caustics
     std.debug.print("Building photon map for caustics...\n", .{});
+    const scene_box = if (world.nodes.len > 0) world.nodes[0].bbox else AABB.empty;
+    const photon_bounds = derivePhotonBounds(scene.primitives.items, scene_box);
+    const cell = photon_bounds.cellSize(photon_grid_size);
+    std.debug.print(
+        "Photon grid covers ({d:.2}, {d:.2}, {d:.2})..({d:.2}, {d:.2}, {d:.2}), cells of {d:.3} x {d:.3} x {d:.3}\n",
+        .{
+            photon_bounds.min[0], photon_bounds.min[1], photon_bounds.min[2],
+            photon_bounds.max[0], photon_bounds.max[1], photon_bounds.max[2],
+            cell[0],              cell[1],              cell[2],
+        },
+    );
     var photon_map = try PhotonMap.init(
         allocator,
         photon_map_capacity,
-        Point3{ -15, -5, -15 }, // Scene bounds min
-        Point3{ 15, 15, 15 }, // Scene bounds max
+        photon_bounds.min,
+        photon_bounds.max,
         photon_grid_size,
     );
     defer photon_map.deinit();
