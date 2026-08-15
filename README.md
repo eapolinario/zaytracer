@@ -122,9 +122,17 @@ looks like a completely black image. The PPM file itself is fine; the viewer
 just cannot read it.
 
 Options:
-- `make view` — renders, converts to PNG, and opens it in your default viewer
+- `make png` — convert the render to `image.png` without opening anything
+- `make view` — convert to PNG and open it in your default viewer
+- `make run view` — render and then view, as two explicit steps
+- `make view IMAGE=image-release` — view an already-rendered image (`image`,
+  `image-debug` or `image-release`)
 - Convert manually: `magick image.ppm image.png` (or `pnmtopng image.ppm > image.png`)
 - Use a viewer with PPM support: GIMP, or ImageMagick's `display image.ppm`
+
+Rendering and viewing are deliberately separate: the raytracer only ever writes
+a `.ppm`, and `png`/`view` only act on a `.ppm` that already exists. Conversion
+is a normal make rule, so re-viewing an unchanged render does not reconvert it.
 
 ## Implementation Notes
 

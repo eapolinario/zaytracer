@@ -1,9 +1,12 @@
 .PHONY: help build build-debug build-release build-preview \
         run run-debug run-release run-both preview \
-        bench bench-debug bench-release bench-both clean test view view-debug view-release
+        bench bench-debug bench-release bench-both clean test png view
 
 # Default target
 .DEFAULT_GOAL := help
+
+# Never leave a half-written file behind when a recipe fails
+.DELETE_ON_ERROR:
 
 # Multithreading flag (can be overridden: make build MULTITHREAD=false)
 MULTITHREAD ?= true
@@ -15,35 +18,8 @@ IO ?= threaded
 PREVIEW_WIDTH ?= 400
 PREVIEW_SAMPLES ?= 10
 
-# Open a rendered image in the desktop image viewer.
-# Many default viewers (notably imv, the default on most Wayland desktops) ship
-# without a PNM/PPM decoder: they open a window but decode nothing, which looks
-# like an all-black image. Convert to PNG first so the default viewer works.
-define open_image
-	src="$(1)"; out="$${src%.ppm}.png"; \
-	if command -v magick > /dev/null 2>&1; then \
-		magick "$$src" "$$out"; \
-	elif command -v convert > /dev/null 2>&1; then \
-		convert "$$src" "$$out"; \
-	elif command -v pnmtopng > /dev/null 2>&1; then \
-		pnmtopng "$$src" > "$$out"; \
-	else \
-		out="$$src"; \
-		echo "Warning: no PPM->PNG converter found (install imagemagick or netpbm)."; \
-		echo "         Viewers without a PPM decoder will show a black window."; \
-	fi; \
-	if command -v xdg-open > /dev/null 2>&1; then \
-		xdg-open "$$out"; \
-	elif command -v feh > /dev/null 2>&1; then \
-		feh "$$out"; \
-	elif command -v eog > /dev/null 2>&1; then \
-		eog "$$out"; \
-	elif command -v display > /dev/null 2>&1; then \
-		display "$$out"; \
-	else \
-		echo "No image viewer found. Image saved to $$out"; \
-	fi
-endef
+# Which render the png/view targets act on: image, image-debug or image-release
+IMAGE ?= image
 
 # Help message
 help:
@@ -71,9 +47,8 @@ help:
 	@echo "Utility targets:"
 	@echo "  make clean              - Clean build artifacts and images"
 	@echo "  make test               - Run unit tests"
-	@echo "  make view               - Run and view the output image (converts to PNG)"
-	@echo "  make view-debug         - View debug output image (converts to PNG)"
-	@echo "  make view-release       - View release output image (converts to PNG)"
+	@echo "  make png                - Convert an existing render to PNG"
+	@echo "  make view               - Convert to PNG and open in the image viewer"
 	@echo "  make help               - Show this help message"
 	@echo ""
 	@echo "Build modes:"
@@ -83,10 +58,13 @@ help:
 	@echo "Build options:"
 	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
 	@echo "  IO=threaded|single_threaded|evented - std.Io implementation (default: threaded)"
+	@echo "  IMAGE=image|image-debug|image-release - render used by png/view (default: image)"
 	@echo "  Examples:"
 	@echo "    make build MULTITHREAD=false       # Single-threaded debug build"
 	@echo "    make run-release MULTITHREAD=false # Single-threaded release run"
 	@echo "    make preview IO=single_threaded    # Preview using the single-threaded Io"
+	@echo "    make run view                      # Render, then open the result"
+	@echo "    make view IMAGE=image-release      # View an already-rendered image"
 
 # Build targets
 build: build-debug
@@ -221,19 +199,46 @@ test:
 	zig build test
 
 # View image targets
-view: run
-	@$(call open_image,image.ppm)
+#
+# Rendering and viewing are separate steps: the binary always writes a .ppm,
+# and the rules below turn an existing .ppm into something a desktop viewer can
+# actually open. Chain them when you want both: make run view
 
-view-debug:
-	@if [ ! -f image-debug.ppm ]; then \
-		echo "Error: image-debug.ppm not found. Run 'make run-both' or 'make bench-both' first."; \
+# Most desktop image viewers cannot decode PPM. In particular imv, the default
+# handler for image/x-portable-pixmap on Wayland, has no PNM backend: it opens a
+# window, decodes nothing, and the render looks completely black. PNG works
+# everywhere. Make skips this when the .png is already newer than the .ppm.
+%.png: %.ppm
+	@if command -v magick > /dev/null 2>&1; then \
+		magick "$<" "$@"; \
+	elif command -v convert > /dev/null 2>&1; then \
+		convert "$<" "$@"; \
+	elif command -v pnmtopng > /dev/null 2>&1; then \
+		pnmtopng "$<" > "$@"; \
+	else \
+		echo "Error: no PPM->PNG converter found. Install imagemagick or netpbm."; \
 		exit 1; \
 	fi
-	@$(call open_image,image-debug.ppm)
+	@echo "✓ Converted $< -> $@"
 
-view-release:
-	@if [ ! -f image-release.ppm ]; then \
-		echo "Error: image-release.ppm not found. Run 'make run-both' or 'make bench-both' first."; \
-		exit 1; \
+# Friendlier than make's default "No rule to make target" when nothing has been
+# rendered yet.
+image.ppm image-debug.ppm image-release.ppm:
+	@echo "Error: $@ not found. Render it first with 'make run', 'make preview',"
+	@echo "       'make run-both' or 'make bench-both'."
+	@exit 1
+
+png: $(IMAGE).png
+
+view: $(IMAGE).png
+	@if command -v xdg-open > /dev/null 2>&1; then \
+		xdg-open "$<"; \
+	elif command -v feh > /dev/null 2>&1; then \
+		feh "$<"; \
+	elif command -v eog > /dev/null 2>&1; then \
+		eog "$<"; \
+	elif command -v display > /dev/null 2>&1; then \
+		display "$<"; \
+	else \
+		echo "No image viewer found. Image saved to $<"; \
 	fi
-	@$(call open_image,image-release.ppm)
