@@ -15,6 +15,36 @@ IO ?= threaded
 PREVIEW_WIDTH ?= 400
 PREVIEW_SAMPLES ?= 10
 
+# Open a rendered image in the desktop image viewer.
+# Many default viewers (notably imv, the default on most Wayland desktops) ship
+# without a PNM/PPM decoder: they open a window but decode nothing, which looks
+# like an all-black image. Convert to PNG first so the default viewer works.
+define open_image
+	src="$(1)"; out="$${src%.ppm}.png"; \
+	if command -v magick > /dev/null 2>&1; then \
+		magick "$$src" "$$out"; \
+	elif command -v convert > /dev/null 2>&1; then \
+		convert "$$src" "$$out"; \
+	elif command -v pnmtopng > /dev/null 2>&1; then \
+		pnmtopng "$$src" > "$$out"; \
+	else \
+		out="$$src"; \
+		echo "Warning: no PPM->PNG converter found (install imagemagick or netpbm)."; \
+		echo "         Viewers without a PPM decoder will show a black window."; \
+	fi; \
+	if command -v xdg-open > /dev/null 2>&1; then \
+		xdg-open "$$out"; \
+	elif command -v feh > /dev/null 2>&1; then \
+		feh "$$out"; \
+	elif command -v eog > /dev/null 2>&1; then \
+		eog "$$out"; \
+	elif command -v display > /dev/null 2>&1; then \
+		display "$$out"; \
+	else \
+		echo "No image viewer found. Image saved to $$out"; \
+	fi
+endef
+
 # Help message
 help:
 	@echo "Zaytracer - Available targets:"
@@ -41,9 +71,9 @@ help:
 	@echo "Utility targets:"
 	@echo "  make clean              - Clean build artifacts and images"
 	@echo "  make test               - Run unit tests"
-	@echo "  make view               - Run and view the output image"
-	@echo "  make view-debug         - View debug output image"
-	@echo "  make view-release       - View release output image"
+	@echo "  make view               - Run and view the output image (converts to PNG)"
+	@echo "  make view-debug         - View debug output image (converts to PNG)"
+	@echo "  make view-release       - View release output image (converts to PNG)"
 	@echo "  make help               - Show this help message"
 	@echo ""
 	@echo "Build modes:"
@@ -183,6 +213,7 @@ clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf zig-cache zig-out .zig-cache
 	rm -f image.ppm image-debug.ppm image-release.ppm
+	rm -f image.png image-debug.png image-release.png
 	@echo "Clean complete!"
 
 # Run tests
@@ -191,46 +222,18 @@ test:
 
 # View image targets
 view: run
-	@if command -v xdg-open > /dev/null 2>&1; then \
-		xdg-open image.ppm; \
-	elif command -v feh > /dev/null 2>&1; then \
-		feh image.ppm; \
-	elif command -v eog > /dev/null 2>&1; then \
-		eog image.ppm; \
-	elif command -v display > /dev/null 2>&1; then \
-		display image.ppm; \
-	else \
-		echo "No image viewer found. Image saved to image.ppm"; \
-	fi
+	@$(call open_image,image.ppm)
 
 view-debug:
 	@if [ ! -f image-debug.ppm ]; then \
 		echo "Error: image-debug.ppm not found. Run 'make run-both' or 'make bench-both' first."; \
 		exit 1; \
 	fi
-	@if command -v xdg-open > /dev/null 2>&1; then \
-		xdg-open image-debug.ppm; \
-	elif command -v feh > /dev/null 2>&1; then \
-		feh image-debug.ppm; \
-	elif command -v eog > /dev/null 2>&1; then \
-		eog image-debug.ppm; \
-	elif command -v display > /dev/null 2>&1; then \
-		display image-debug.ppm; \
-	else \
-		echo "No image viewer found. Image at: image-debug.ppm"; \
-	fi
+	@$(call open_image,image-debug.ppm)
 
 view-release:
 	@if [ ! -f image-release.ppm ]; then \
 		echo "Error: image-release.ppm not found. Run 'make run-both' or 'make bench-both' first."; \
 		exit 1; \
 	fi
-	@if command -v xdg-open > /dev/null 2>&1; then \
-		xdg-open image-release.ppm; \
-	elif command -v feh > /dev/null 2>&1; then \
-		feh image-release.ppm; \
-	elif command -v eog > /dev/null 2>&1; then \
-		eog image-release.ppm; \
-	else \
-		echo "No image viewer found. Image at: image-release.ppm"; \
-	fi
+	@$(call open_image,image-release.ppm)

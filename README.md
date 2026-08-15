@@ -113,10 +113,18 @@ would decide how render tasks execute and `-Dio` would subsume
 
 ## Viewing the Output
 
-The raytracer outputs PPM format images. You can view them with:
-- GIMP
-- ImageMagick: `display image.ppm`
-- Convert to PNG: `convert image.ppm image.png`
+The raytracer writes `image.ppm` (plain-text PPM / Netpbm `P3`).
+
+Note that many desktop image viewers cannot decode PPM at all. In particular
+`imv` — the default handler for `image/x-portable-pixmap` on most Wayland
+desktops — has no PNM backend, so it opens a window that decodes nothing and
+looks like a completely black image. The PPM file itself is fine; the viewer
+just cannot read it.
+
+Options:
+- `make view` — renders, converts to PNG, and opens it in your default viewer
+- Convert manually: `magick image.ppm image.png` (or `pnmtopng image.ppm > image.png`)
+- Use a viewer with PPM support: GIMP, or ImageMagick's `display image.ppm`
 
 ## Implementation Notes
 
