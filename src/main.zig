@@ -1930,6 +1930,45 @@ const Mesh = struct {
         }
     }
 
+    /// The mesh's axis-aligned bounds.
+    pub fn bounds(self: Mesh) AABB {
+        var box = AABB.empty;
+        for (self.triangles) |tri| {
+            box = AABB.fromBoxes(box, tri.boundingBox());
+        }
+        return box;
+    }
+
+    /// Centre the mesh on `center` and scale it until its longest side is
+    /// `longest_side`.
+    ///
+    /// Scanned models arrive in whatever units the scanner used and wherever
+    /// the scanner's origin happened to be: the XYZ RGB dragon spans about 200
+    /// units across and does not straddle the origin. Placing one by hand means
+    /// guessing constants that are wrong for the next model.
+    pub fn fitTo(self: *Mesh, center: Point3, longest_side: f64) void {
+        const box = self.bounds();
+        const longest = @max(@max(box.x.size(), box.y.size()), box.z.size());
+        if (!(longest > 0.0)) return;
+
+        const box_center = Point3{
+            (box.x.min + box.x.max) / 2.0,
+            (box.y.min + box.y.max) / 2.0,
+            (box.z.min + box.z.max) / 2.0,
+        };
+
+        // scale() works about the origin, so the mesh has to visit it first.
+        self.translate(neg(box_center));
+        self.scale(longest_side / longest);
+        self.translate(center);
+    }
+
+    /// Drop the mesh straight down until its lowest point rests at `y`.
+    pub fn placeOnGround(self: *Mesh, y: f64) void {
+        const box = self.bounds();
+        self.translate(Vec3{ 0, y - box.y.min, 0 });
+    }
+
     /// Generate smooth vertex normals by averaging face normals
     pub fn generateSmoothNormals(self: *Mesh, allocator: std.mem.Allocator) !void {
         // HashMap to accumulate normals for each unique vertex position
@@ -2293,6 +2332,9 @@ const Scene = struct {
 /// repository, because CI renders it without running `make models`.
 const default_scene_name = "cover";
 
+/// Fetched by `make models`, not committed. See models/manifest.tsv.
+const dragon_model_path = "models/xyzrgb_dragon.obj";
+
 const scenes = [_]Scene{
     .{
         .name = "cover",
@@ -2303,6 +2345,11 @@ const scenes = [_]Scene{
         .name = "cornell-box",
         .description = "Closed Cornell box lit by a ceiling panel, with a glass and a metal sphere",
         .build = buildCornellBoxScene,
+    },
+    .{
+        .name = "glass-dragon",
+        .description = "XYZ RGB Asian Dragon in glass, 250k triangles (needs 'make models')",
+        .build = buildGlassDragonScene,
     },
 };
 
@@ -2502,6 +2549,124 @@ fn buildCornellBoxScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
 
     return scene;
 }
+
+/// The glass dragon: the XYZ RGB Asian Dragon rendered as a dielectric, which
+/// is the classic photon-mapping subject and the reason this scene exists.
+///
+/// Lit by a panel against a near-black sky rather than by daylight. An open,
+/// sky-lit field washes a caustic out — that is the complaint that started
+/// this scene — so the dragon gets a dark room and one lamp instead.
+///
+/// The model is fetched rather than committed, so it may not be there.
+fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    var scene = SceneData.init(allocator, CameraSpec{
+        // Replaced below, once the dragon's fitted size is known.
+        .lookfrom = Point3{ 0, 3, 11 },
+        .lookat = Point3{ 0, 1, 0 },
+        .vfov = 32.0,
+    });
+    errdefer scene.deinit();
+
+    scene.background = .{ .solid = Color{ 0.02, 0.025, 0.035 } };
+    // Glass over a large floor sends a lot of photons a long way, and a closed
+    // budget would stop the emission early and dim the caustic.
+    scene.photons = .{ .emitted = 2_000_000, .capacity = 700_000 };
+
+    // A flat floor rather than a sphere of radius 1000: the photon grid is
+    // sized from the scene, and a floor that is honestly flat keeps that box
+    // tight around the part of the world the caustic lands on.
+    const floor = 14.0;
+    try scene.addQuad(
+        Point3{ -floor, 0, -floor },
+        Vec3{ 2 * floor, 0, 0 },
+        Vec3{ 0, 0, 2 * floor },
+        Material.lambertian(Color{ 0.58, 0.56, 0.52 }),
+    );
+
+    var dragon_box: AABB = undefined;
+    {
+        var dragon = Mesh.fromOBJ(
+            allocator,
+            io,
+            dragon_model_path,
+            Material.dielectric(1.5),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print(
+                    "Error: {s} is not here. It is fetched rather than committed: run 'make models'.\n",
+                    .{dragon_model_path},
+                );
+                return err;
+            },
+            else => return err,
+        };
+        defer dragon.deinit();
+
+        try dragon.generateSmoothNormals(allocator);
+        dragon.rotateY(140.0);
+        dragon.fitTo(Point3{ 0, 0, 0 }, 6.0);
+        dragon.placeOnGround(0.0);
+
+        dragon_box = dragon.bounds();
+        try scene.addMesh(dragon);
+    }
+
+    const center = Point3{
+        (dragon_box.x.min + dragon_box.x.max) / 2.0,
+        (dragon_box.y.min + dragon_box.y.max) / 2.0,
+        (dragon_box.z.min + dragon_box.z.max) / 2.0,
+    };
+    const reach = @max(@max(dragon_box.x.size(), dragon_box.y.size()), dragon_box.z.size());
+
+    // Frame whatever the model turned out to be rather than a hand-tuned guess.
+    const distance = reach * 1.9;
+    scene.camera = CameraSpec{
+        .lookfrom = Point3{ center[0] - 0.35 * reach, center[1] + 0.55 * reach, center[2] + distance },
+        .lookat = center,
+        .vfov = 34.0,
+        .defocus_angle = 0.25,
+        .focus_dist = distance,
+    };
+
+    // A panel over the dragon, high enough to light the floor around it.
+    const panel_side = reach * 0.55;
+    const panel_corner = Point3{
+        center[0] - panel_side / 2.0,
+        dragon_box.y.max + reach * 0.9,
+        center[2] - panel_side / 2.0,
+    };
+    const panel_u = Vec3{ panel_side, 0, 0 };
+    const panel_v = Vec3{ 0, 0, panel_side };
+    const emission = Color{ 26.0, 25.0, 24.0 };
+
+    try scene.addQuad(panel_corner, panel_u, panel_v, Material.diffuseLight(Color{ 1.0, 0.96, 0.92 }, 26.0));
+    try scene.addLight(Light.quadLight(panel_corner, panel_u, panel_v, emission));
+
+    return scene;
+}
+
+// ============================================================================
+// Timing
+// ============================================================================
+
+/// Stopwatch over the render's stages. Loading a 250k-triangle model, building
+/// a BVH over it and shooting photons at it are three very different costs, and
+/// one total tells you nothing about which of them to worry about.
+const StageTimer = struct {
+    io: std.Io,
+    last: std.Io.Timestamp,
+
+    pub fn start(io: std.Io) StageTimer {
+        return StageTimer{ .io = io, .last = std.Io.Timestamp.now(io, .awake) };
+    }
+
+    pub fn lap(self: *StageTimer) std.Io.Duration {
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const elapsed = self.last.durationTo(now);
+        self.last = now;
+        return elapsed;
+    }
+};
 
 // ============================================================================
 // Command Line
@@ -2781,14 +2946,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const io = io_backend.io();
 
     std.debug.print("Scene: {s}\n", .{args.scene.name});
+    var timer = StageTimer.start(io);
     var scene = try args.scene.build(allocator, io);
     defer scene.deinit();
+    std.debug.print("Scene built in {f}\n", .{timer.lap()});
 
     // Build BVH for efficient ray-object intersection
     std.debug.print("Building BVH from {d} primitives...\n", .{scene.primitives.items.len});
     const world = try BVH.init(allocator, scene.primitives.items);
     defer world.deinit();
-    std.debug.print("BVH built with {d} nodes\n", .{world.nodes.len});
+    std.debug.print("BVH built with {d} nodes in {f}\n", .{ world.nodes.len, timer.lap() });
 
     // Build photon map for caustics
     std.debug.print("Building photon map for caustics...\n", .{});
@@ -2841,7 +3008,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         // Build spatial grid for fast photon queries
         try photon_map.buildGrid(photon_count);
-        std.debug.print("Built photon spatial grid\n", .{});
+        std.debug.print("Built photon spatial grid, caustic pass took {f}\n", .{timer.lap()});
     } else {
         std.debug.print("Scene has no lights: skipping caustics\n", .{});
     }
@@ -2961,7 +3128,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    std.debug.print("\rDone.                 \n", .{});
+    std.debug.print("\rRendered in {f}\n", .{timer.lap()});
 }
 
 // ============================================================================
