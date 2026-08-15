@@ -247,13 +247,14 @@ const MaterialType = enum {
     lambertian,
     metal,
     dielectric,
+    diffuse_light,
 };
 
 /// Whether a material bends light along a single (possibly fuzzed) direction.
 /// A photon has to bounce off one of these before it can form a caustic.
 fn isSpecular(material_type: MaterialType) bool {
     return switch (material_type) {
-        .lambertian => false,
+        .lambertian, .diffuse_light => false,
         .metal, .dielectric => true,
     };
 }
@@ -263,6 +264,7 @@ const Material = struct {
     albedo: Color,
     fuzz: f64, // Only used for metal
     refraction_index: f64, // Only used for dielectric
+    emission: Color, // Only used for diffuse_light
 
     pub fn lambertian(albedo: Color) Material {
         return Material{
@@ -270,6 +272,7 @@ const Material = struct {
             .albedo = albedo,
             .fuzz = 0.0,
             .refraction_index = 0.0,
+            .emission = Color{ 0, 0, 0 },
         };
     }
 
@@ -279,6 +282,7 @@ const Material = struct {
             .albedo = albedo,
             .fuzz = if (fuzz < 1.0) fuzz else 1.0,
             .refraction_index = 0.0,
+            .emission = Color{ 0, 0, 0 },
         };
     }
 
@@ -288,6 +292,28 @@ const Material = struct {
             .albedo = Color{ 1.0, 1.0, 1.0 },
             .fuzz = 0.0,
             .refraction_index = refraction_index,
+            .emission = Color{ 0, 0, 0 },
+        };
+    }
+
+    /// A surface that emits light and reflects none of it. This is the only
+    /// thing in the renderer that puts light into a closed scene: without one,
+    /// a sealed room is lit by nothing but its caustics.
+    pub fn diffuseLight(color: Color, intensity: f64) Material {
+        return Material{
+            .material_type = .diffuse_light,
+            .albedo = Color{ 0, 0, 0 },
+            .fuzz = 0.0,
+            .refraction_index = 0.0,
+            .emission = mul(color, intensity),
+        };
+    }
+
+    /// Light leaving the surface on its own account, before anything bounces.
+    pub fn emitted(self: Material) Color {
+        return switch (self.material_type) {
+            .diffuse_light => self.emission,
+            .lambertian, .metal, .dielectric => Color{ 0, 0, 0 },
         };
     }
 
@@ -327,6 +353,10 @@ const Material = struct {
 
                 scattered.* = Ray.init(rec.point, direction);
                 return true;
+            },
+            .diffuse_light => {
+                // A light source only emits; nothing bounces off it.
+                return false;
             },
         }
     }
@@ -1275,6 +1305,10 @@ fn tracePhoton(
             };
             photon_count.* += 1;
         },
+        .diffuse_light => {
+            // Absorbed. Storing it would paint a caustic onto the lamp itself,
+            // and the light's own emission already accounts for this energy.
+        },
         .metal => {
             // Reflect and continue (specular bounce for caustics)
             const reflected = reflect(unitVector(ray.direction), rec.normal);
@@ -1832,11 +1866,37 @@ fn rotatePointY(point: Vec3, cos_theta: f64, sin_theta: f64) Vec3 {
 // Ray Color (Background)
 // ============================================================================
 
-fn rayColor(ray: Ray, world: BVH, depth: i32, rng: std.Random) Color {
-    return rayColorWithPhotons(ray, world, depth, rng, null);
-}
+/// What a ray sees when it hits nothing. The sky gradient lights every open
+/// scene in the book; a closed room needs it gone, or light leaks in through
+/// the wall the camera looks through.
+const Background = union(enum) {
+    sky,
+    solid: Color,
 
-fn rayColorWithPhotons(ray: Ray, world: BVH, depth: i32, rng: std.Random, photon_map: ?*const PhotonMap) Color {
+    pub fn sample(self: Background, direction: Vec3) Color {
+        return switch (self) {
+            .sky => blk: {
+                // Linear interpolation from white to blue based on height
+                const unit_direction = unitVector(direction);
+                const a = 0.5 * (unit_direction[1] + 1.0);
+                const white = Color{ 1.0, 1.0, 1.0 };
+                const blue = Color{ 0.5, 0.7, 1.0 };
+                break :blk add(mul(white, 1.0 - a), mul(blue, a));
+            },
+            .solid => |color| color,
+        };
+    }
+};
+
+/// Everything a ray needs that does not change from ray to ray. Passing one
+/// struct keeps the recursion signature from growing a parameter per feature.
+const RenderContext = struct {
+    world: BVH,
+    background: Background = .sky,
+    photon_map: ?*const PhotonMap = null,
+};
+
+fn rayColor(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
         return Color{ 0, 0, 0 };
@@ -1844,16 +1904,18 @@ fn rayColorWithPhotons(ray: Ray, world: BVH, depth: i32, rng: std.Random, photon
 
     var rec: HitRecord = undefined;
 
-    if (world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
+    if (ctx.world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
         var scattered: Ray = undefined;
         var attenuation: Color = undefined;
 
+        const emitted = rec.material.emitted();
+
         // Add caustics contribution for diffuse surfaces
         var caustics_contribution = Color{ 0, 0, 0 };
-        if (rec.material.material_type == .lambertian and photon_map != null) {
+        if (rec.material.material_type == .lambertian and ctx.photon_map != null) {
             // The map holds LS+D photons only, so this adds the caustics the
             // recursive estimate below cannot find, and nothing it can.
-            caustics_contribution = photon_map.?.estimateRadiance(
+            caustics_contribution = ctx.photon_map.?.estimateRadiance(
                 rec.point,
                 rec.normal,
                 rec.material.albedo,
@@ -1862,21 +1924,13 @@ fn rayColorWithPhotons(ray: Ray, world: BVH, depth: i32, rng: std.Random, photon
         }
 
         if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
-            const indirect = rayColorWithPhotons(scattered, world, depth - 1, rng, photon_map);
-            return add(mulVec(attenuation, indirect), caustics_contribution);
+            const indirect = rayColor(ctx, scattered, depth - 1, rng);
+            return add(add(emitted, mulVec(attenuation, indirect)), caustics_contribution);
         }
-        return caustics_contribution;
+        return add(emitted, caustics_contribution);
     }
 
-    // Create a gradient background from white to blue
-    const unit_direction = unitVector(ray.direction);
-    const a = 0.5 * (unit_direction[1] + 1.0);
-
-    // Linear interpolation: (1-a)*white + a*blue
-    const white = Color{ 1.0, 1.0, 1.0 };
-    const blue = Color{ 0.5, 0.7, 1.0 };
-
-    return add(mul(white, 1.0 - a), mul(blue, a));
+    return ctx.background.sample(ray.direction);
 }
 
 // ============================================================================
@@ -2005,6 +2059,7 @@ const SceneData = struct {
     primitives: std.ArrayList(Primitive),
     lights: std.ArrayList(Light),
     camera: CameraSpec,
+    background: Background,
 
     pub fn init(allocator: std.mem.Allocator, camera: CameraSpec) SceneData {
         return SceneData{
@@ -2012,6 +2067,7 @@ const SceneData = struct {
             .primitives = .empty,
             .lights = .empty,
             .camera = camera,
+            .background = .sky,
         };
     }
 
@@ -2378,12 +2434,11 @@ const WorkerContext = struct {
     queue: *TileQueue,
     pixel_buffer: *PixelBuffer,
     camera: *const Camera,
-    world: *const BVH,
+    render: RenderContext,
     samples_per_pixel: u32,
     max_depth: i32,
     thread_id: u32,
     progress: *Progress,
-    photon_map: ?*const PhotonMap,
 };
 
 fn generateTiles(allocator: std.mem.Allocator, width: u32, height: u32, tile_size: u32) ![]Tile {
@@ -2425,7 +2480,7 @@ fn workerThread(ctx: *WorkerContext) void {
                 var sample: u32 = 0;
                 while (sample < ctx.samples_per_pixel) : (sample += 1) {
                     const ray = ctx.camera.getRay(x, y, rng);
-                    pixel_color = add(pixel_color, rayColorWithPhotons(ray, ctx.world.*, ctx.max_depth, rng, ctx.photon_map));
+                    pixel_color = add(pixel_color, rayColor(ctx.render, ray, ctx.max_depth, rng));
                 }
 
                 // Write to shared buffer (no race condition - each thread writes different tiles)
@@ -2525,6 +2580,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Final: -Dwidth=1200 -Dsamples=500 (slow, ~minutes to hours)
     const camera = scene.camera.toCamera(build_options.image_width);
 
+    const render_ctx = RenderContext{
+        .world = world,
+        .background = scene.background,
+        .photon_map = &photon_map,
+    };
+
     const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
     const max_depth: i32 = 50;
 
@@ -2572,12 +2633,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .queue = &tile_queue,
                 .pixel_buffer = &pixel_buffer,
                 .camera = &camera,
-                .world = &world,
+                .render = render_ctx,
                 .samples_per_pixel = samples_per_pixel,
                 .max_depth = max_depth,
                 .thread_id = @intCast(i),
                 .progress = &progress,
-                .photon_map = &photon_map,
             };
 
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{&contexts[i]});
@@ -2621,7 +2681,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 var sample: u32 = 0;
                 while (sample < samples_per_pixel) : (sample += 1) {
                     const ray = camera.getRay(i, j, rng);
-                    pixel_color = add(pixel_color, rayColorWithPhotons(ray, world, max_depth, rng, &photon_map));
+                    pixel_color = add(pixel_color, rayColor(render_ctx, ray, max_depth, rng));
                 }
 
                 try writeColor(file, io, pixel_color, samples_per_pixel);
