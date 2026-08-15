@@ -846,7 +846,11 @@ fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_off
                 .sphere => |s| s.center,
                 .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0),
             };
-            return a_center[ctx.axis_idx] < b_center[ctx.axis_idx];
+            return switch (ctx.axis_idx) {
+                0 => a_center[0] < b_center[0],
+                1 => a_center[1] < b_center[1],
+                else => a_center[2] < b_center[2],
+            };
         }
     };
 
@@ -883,7 +887,7 @@ const PhotonMap = struct {
         var grid_cells = try allocator.alloc(std.ArrayList(usize), num_cells);
 
         for (0..num_cells) |i| {
-            grid_cells[i] = std.ArrayList(usize){};
+            grid_cells[i] = .empty;
         }
 
         return PhotonMap{
@@ -1099,7 +1103,7 @@ const OBJParseError = error{
     InvalidFormat,
     MissingData,
     InvalidIndex,
-} || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.ReadError;
+} || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.Reader.Error;
 
 const OBJData = struct {
     vertices: []Vec3,
@@ -1138,12 +1142,10 @@ const VertexDescriptor = struct {
 };
 
 fn parseOBJ(allocator: std.mem.Allocator, filepath: []const u8) !OBJData {
-    const file = try std.fs.cwd().openFile(filepath, .{});
-    defer file.close();
-
     // Read entire file (reasonable for small-medium meshes up to 50MB)
     const max_file_size = 50 * 1024 * 1024;
-    const contents = try file.readToEndAlloc(allocator, max_file_size);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
     defer allocator.free(contents);
 
     // Dynamic arrays for parsed data
@@ -1609,7 +1611,7 @@ const Camera = struct {
 // Color Utilities
 // ============================================================================
 
-fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
+fn writeColor(file: std.Io.File, io: std.Io, color: Color, samples_per_pixel: u32) !void {
     var r = color[0];
     var g = color[1];
     var b = color[2];
@@ -1632,7 +1634,7 @@ fn writeColor(file: std.fs.File, color: Color, samples_per_pixel: u32) !void {
 
     var buf: [64]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "{d} {d} {d}\n", .{ ir, ig, ib });
-    _ = try file.writeAll(line);
+    try file.writeStreamingAll(io, line);
 }
 
 // ============================================================================
@@ -1697,13 +1699,13 @@ const PixelBuffer = struct {
 const Progress = struct {
     completed_tiles: std.atomic.Value(usize),
     total_tiles: usize,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     pub fn init(total_tiles: usize) Progress {
         return Progress{
             .completed_tiles = std.atomic.Value(usize).init(0),
             .total_tiles = total_tiles,
-            .mutex = .{},
+            .mutex = .init,
         };
     }
 
@@ -1712,8 +1714,9 @@ const Progress = struct {
 
         // Print progress every 10 tiles to reduce output spam
         if (completed % 10 == 0 or completed == self.total_tiles) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = std.Io.Threaded.global_single_threaded.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
             const percentage = @as(f64, @floatFromInt(completed)) / @as(f64, @floatFromInt(self.total_tiles)) * 100.0;
             std.debug.print("\rProgress: {d:.1}% ({d}/{d} tiles) - Thread {d}    ", .{ percentage, completed, self.total_tiles, thread_id });
@@ -1794,7 +1797,7 @@ fn workerThread(ctx: *WorkerContext) void {
 // ============================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1949,13 +1952,14 @@ pub fn main() !void {
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
 
     // Create output file
-    const file = try std.fs.cwd().createFile("image.ppm", .{});
-    defer file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.cwd().createFile(io, "image.ppm", .{});
+    defer file.close(io);
 
     // Write PPM header
     var header_buf: [256]u8 = undefined;
     const header = try std.fmt.bufPrint(&header_buf, "P3\n{d} {d}\n255\n", .{ camera.image_width, camera.image_height });
-    _ = try file.writeAll(header);
+    try file.writeStreamingAll(io, header);
 
     if (comptime use_multithreading) {
         // ===== MULTI-THREADED PATH =====
@@ -2013,7 +2017,7 @@ pub fn main() !void {
             var x: u32 = 0;
             while (x < camera.image_width) : (x += 1) {
                 const color = pixel_buffer.get(x, y);
-                try writeColor(file, color, samples_per_pixel);
+                try writeColor(file, io, color, samples_per_pixel);
             }
         }
     } else {
@@ -2040,7 +2044,7 @@ pub fn main() !void {
                     pixel_color = add(pixel_color, rayColorWithPhotons(ray, world, max_depth, rng, &photon_map));
                 }
 
-                try writeColor(file, pixel_color, samples_per_pixel);
+                try writeColor(file, io, pixel_color, samples_per_pixel);
             }
         }
     }

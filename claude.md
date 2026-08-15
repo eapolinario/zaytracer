@@ -212,27 +212,27 @@ const Interval = struct {
 ### Goal: Implement multisampling antialiasing for smoother images
 
 ### Implementation Details:
-1. Add random number generation using Zig's std.rand
+1. Add random number generation using Zig's `std.Random`
 2. Create camera class to manage rays
 3. Implement samples-per-pixel parameter
 4. Add random ray perturbation for each sample
 5. Average sample colors
 
 ### Key Zig Idioms:
-- Use `std.rand.DefaultPrng` for RNG
-- Use `std.rand.Random` interface
+- Use `std.Random.DefaultPrng` for RNG
+- Use `std.Random` interface
 - Pass RNG as parameter (don't use global state)
 - Use `comptime` for constants where appropriate
 
 ### Random Number Utilities:
 ```zig
 // Random float in [0, 1)
-fn randomFloat(rng: std.rand.Random) f64 {
+fn randomFloat(rng: std.Random) f64 {
     return rng.float(f64);
 }
 
 // Random float in [min, max)
-fn randomFloatRange(rng: std.rand.Random, min: f64, max: f64) f64 {
+fn randomFloatRange(rng: std.Random, min: f64, max: f64) f64 {
     return min + (max - min) * randomFloat(rng);
 }
 ```
@@ -263,7 +263,7 @@ fn randomFloatRange(rng: std.rand.Random, min: f64, max: f64) f64 {
 
 ### Random Vector Functions:
 ```zig
-fn randomVec3(rng: std.rand.Random) Vec3 {
+fn randomVec3(rng: std.Random) Vec3 {
     return Vec3{
         .x = randomFloat(rng),
         .y = randomFloat(rng),
@@ -271,7 +271,7 @@ fn randomVec3(rng: std.rand.Random) Vec3 {
     };
 }
 
-fn randomVec3Range(rng: std.rand.Random, min: f64, max: f64) Vec3 {
+fn randomVec3Range(rng: std.Random, min: f64, max: f64) Vec3 {
     return Vec3{
         .x = randomFloatRange(rng, min, max),
         .y = randomFloatRange(rng, min, max),
@@ -279,14 +279,14 @@ fn randomVec3Range(rng: std.rand.Random, min: f64, max: f64) Vec3 {
     };
 }
 
-fn randomInUnitSphere(rng: std.rand.Random) Vec3 {
+fn randomInUnitSphere(rng: std.Random) Vec3 {
     while (true) {
         const p = randomVec3Range(rng, -1.0, 1.0);
         if (p.lengthSquared() < 1.0) return p;
     }
 }
 
-fn randomUnitVector(rng: std.rand.Random) Vec3 {
+fn randomUnitVector(rng: std.Random) Vec3 {
     return randomInUnitSphere(rng).unitVector();
 }
 ```
@@ -406,7 +406,7 @@ fn degreesToRadians(degrees: f64) f64 {
 
 ### Random Disk Sampling:
 ```zig
-fn randomInUnitDisk(rng: std.rand.Random) Vec3 {
+fn randomInUnitDisk(rng: std.Random) Vec3 {
     while (true) {
         const p = Vec3{
             .x = randomFloatRange(rng, -1.0, 1.0),

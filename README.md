@@ -27,7 +27,7 @@ This will provide a shell with Zig and ZLS (Zig Language Server) available.
 
 ### Manual Installation
 
-Alternatively, install Zig 0.13.0 or later from [ziglang.org](https://ziglang.org/download/).
+Alternatively, install Zig 0.16.0 from [ziglang.org](https://ziglang.org/download/).
 
 ## Building
 
