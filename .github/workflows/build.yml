@@ -23,6 +23,9 @@ jobs:
     - name: Setup Magic Nix Cache
       uses: DeterminateSystems/magic-nix-cache-action@v8
 
+    - name: Run tests
+      run: nix develop --command make test
+
     - name: Build and run preview
       run: nix develop --command make preview
 

@@ -1,6 +1,7 @@
 .PHONY: help build build-debug build-release build-preview \
-        run run-debug run-release run-both preview \
-        bench bench-debug bench-release bench-both clean test png view
+        run run-debug run-release run-both preview scenes \
+        bench bench-debug bench-release bench-both clean test png view \
+        models models-verify
 
 # Default target
 .DEFAULT_GOAL := help
@@ -20,6 +21,16 @@ PREVIEW_SAMPLES ?= 10
 
 # Which render the png/view targets act on: image, image-debug or image-release
 IMAGE ?= image
+
+# Scene to render. Empty means the binary's default (the book cover scene).
+# List them with: make scenes
+SCENE ?=
+SCENE_ARG = $(if $(SCENE),--scene=$(SCENE),)
+
+# Models that are fetched rather than committed
+MODELS_DIR := models
+MANIFEST := $(MODELS_DIR)/manifest.tsv
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256")
 
 # Help message
 help:
@@ -47,6 +58,9 @@ help:
 	@echo "Utility targets:"
 	@echo "  make clean              - Clean build artifacts and images"
 	@echo "  make test               - Run unit tests"
+	@echo "  make scenes             - List the available scenes"
+	@echo "  make models             - Fetch the models in models/manifest.tsv (sha256 verified)"
+	@echo "  make models-verify      - Re-check fetched models against the manifest"
 	@echo "  make png                - Convert an existing render to PNG"
 	@echo "  make view               - Convert to PNG and open in the image viewer"
 	@echo "  make help               - Show this help message"
@@ -59,10 +73,12 @@ help:
 	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
 	@echo "  IO=threaded|single_threaded|evented - std.Io implementation (default: threaded)"
 	@echo "  IMAGE=image|image-debug|image-release - render used by png/view (default: image)"
+	@echo "  SCENE=<name>            - Scene to render (default: cover). See 'make scenes'"
 	@echo "  Examples:"
 	@echo "    make build MULTITHREAD=false       # Single-threaded debug build"
 	@echo "    make run-release MULTITHREAD=false # Single-threaded release run"
 	@echo "    make preview IO=single_threaded    # Preview using the single-threaded Io"
+	@echo "    make preview SCENE=cornell-box     # Preview a different scene"
 	@echo "    make run view                      # Render, then open the result"
 	@echo "    make view IMAGE=image-release      # View an already-rendered image"
 
@@ -86,20 +102,20 @@ run: run-debug
 
 run-debug: build-debug
 	@echo "Running Debug build..."
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 
 run-release: build-release
 	@echo "Running ReleaseFast build..."
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 
 preview: build-preview
 	@echo "========================================="
 	@echo "   PREVIEW MODE (Fast Iteration)"
-	@echo "   Resolution: $(PREVIEW_WIDTH)x$$(echo "$(PREVIEW_WIDTH) / 16 * 9" | bc)"
+	@echo "   Width: $(PREVIEW_WIDTH)px (the scene picks the aspect ratio)"
 	@echo "   Samples: $(PREVIEW_SAMPLES)"
 	@echo "========================================="
 	@echo ""
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@echo ""
 	@echo "✓ Preview complete! Output: image.ppm"
 	@echo "  For final quality: make run-release"
@@ -111,13 +127,13 @@ run-both: build-debug build-release
 	@echo ""
 	@echo "Running Debug build..."
 	@rm -f image.ppm image-debug.ppm
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@mv image.ppm image-debug.ppm
 	@echo "✓ Debug output saved to: image-debug.ppm"
 	@echo ""
 	@echo "Running ReleaseFast build..."
 	@rm -f image.ppm image-release.ppm
-	./zig-out/bin/zaytracer
+	./zig-out/bin/zaytracer $(SCENE_ARG)
 	@mv image.ppm image-release.ppm
 	@echo "✓ Release output saved to: image-release.ppm"
 	@echo ""
@@ -131,13 +147,13 @@ run-both: build-debug build-release
 bench-debug: build-debug
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@echo ""
 
 bench-release: build-release
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@echo ""
 
 bench:
@@ -163,7 +179,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking Debug build ==="
 	@rm -f image.ppm image-debug.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@mv image.ppm image-debug.ppm
 	@echo "✓ Debug output saved to: image-debug.ppm"
 	@echo ""
@@ -171,7 +187,7 @@ bench-both: build-debug build-release
 	@echo ""
 	@echo "=== Benchmarking ReleaseFast build ==="
 	@rm -f image.ppm image-release.ppm
-	@bash -c 'time ./zig-out/bin/zaytracer'
+	@bash -c 'time ./zig-out/bin/zaytracer $(SCENE_ARG)'
 	@mv image.ppm image-release.ppm
 	@echo "✓ Release output saved to: image-release.ppm"
 	@echo ""
@@ -197,6 +213,54 @@ clean:
 # Run tests
 test:
 	zig build test
+
+# Fetch the models listed in models/manifest.tsv that are not already present,
+# and verify each against its sha256 before putting it in place. Models large
+# enough to be worth fetching are too large to commit, and the Stanford-derived
+# ones are not ours to redistribute anyway.
+models:
+	@set -e; \
+	tab=$$(printf '\t'); \
+	while IFS="$$tab" read -r name url sum rest; do \
+		case "$$name" in ''|\#*) continue ;; esac; \
+		dest="$(MODELS_DIR)/$$name"; \
+		if [ -f "$$dest" ]; then echo "have   $$name"; continue; fi; \
+		if [ -z "$$url" ] || [ -z "$$sum" ]; then \
+			echo "Error: $(MANIFEST): entry '$$name' is missing a url or a sha256" >&2; exit 1; \
+		fi; \
+		echo "fetch  $$name"; \
+		curl -fL --progress-bar -o "$$dest.part" "$$url"; \
+		actual=$$($(SHA256) "$$dest.part" | cut -d' ' -f1); \
+		if [ "$$actual" != "$$sum" ]; then \
+			rm -f "$$dest.part"; \
+			echo "Error: $$name does not match its checksum" >&2; \
+			echo "  expected $$sum" >&2; \
+			echo "  actual   $$actual" >&2; \
+			exit 1; \
+		fi; \
+		mv "$$dest.part" "$$dest"; \
+		echo "ok     $$name"; \
+	done < $(MANIFEST)
+
+# Re-check the models already on disk against the manifest.
+models-verify:
+	@set -e; \
+	tab=$$(printf '\t'); \
+	missing=0; bad=0; \
+	while IFS="$$tab" read -r name url sum rest; do \
+		case "$$name" in ''|\#*) continue ;; esac; \
+		dest="$(MODELS_DIR)/$$name"; \
+		if [ ! -f "$$dest" ]; then echo "absent $$name"; missing=$$((missing+1)); continue; fi; \
+		actual=$$($(SHA256) "$$dest" | cut -d' ' -f1); \
+		if [ "$$actual" = "$$sum" ]; then echo "ok     $$name"; \
+		else echo "BAD    $$name ($$actual)"; bad=$$((bad+1)); fi; \
+	done < $(MANIFEST); \
+	if [ $$bad -gt 0 ]; then echo "$$bad model(s) failed verification" >&2; exit 1; fi; \
+	if [ $$missing -gt 0 ]; then echo "$$missing model(s) not fetched; run 'make models'"; fi
+
+# List the scenes the binary knows about
+scenes: build-debug
+	@./zig-out/bin/zaytracer --list-scenes
 
 # View image targets
 #

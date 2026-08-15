@@ -12,6 +12,14 @@ zig-out/
 *.jpg
 *.jpeg
 
+# Models fetched by 'make models' are too large to commit, and the
+# Stanford-derived ones are not ours to redistribute. Keep the manifest and the
+# two small models the default scene needs.
+models/*
+!models/manifest.tsv
+!models/teapot.obj
+!models/test_cube.obj
+
 # IDE / Editor files
 .vscode/
 .idea/
