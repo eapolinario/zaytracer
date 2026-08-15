@@ -1,5 +1,68 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
+
+// ============================================================================
+// Io Backend
+// ============================================================================
+
+/// The `std.Io` implementation is chosen at build time via `-Dio=`.
+///
+/// * `threaded`        - thread pool backed, supports concurrency (default)
+/// * `single_threaded` - no concurrency support; `Io.async`/`Io.concurrent`
+///                       are unavailable, but blocking file I/O and the
+///                       futex-based `Io.Mutex` still work
+/// * `evented`         - io_uring on Linux, kqueue on BSD, Dispatch on Darwin
+const IoBackend = switch (build_options.io_impl) {
+    .threaded, .single_threaded => struct {
+        state: std.Io.Threaded,
+
+        fn init(self: *@This(), gpa: std.mem.Allocator) !void {
+            self.state = switch (build_options.io_impl) {
+                .threaded => .init(gpa, .{}),
+                else => .init_single_threaded,
+            };
+        }
+
+        fn io(self: *@This()) std.Io {
+            return self.state.io();
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinit();
+        }
+    },
+    .evented => struct {
+        state: std.Io.Evented,
+
+        fn init(self: *@This(), gpa: std.mem.Allocator) !void {
+            comptime checkEventedSupported();
+            try self.state.init(gpa, .{});
+        }
+
+        fn io(self: *@This()) std.Io {
+            return self.state.io();
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinit();
+        }
+    },
+};
+
+/// `std.Io.Evented` is not usable everywhere. Fail with an actionable message
+/// instead of letting the standard library produce confusing errors.
+fn checkEventedSupported() void {
+    if (std.Io.Evented == void) @compileError(
+        "-Dio=evented is not supported on this target; use -Dio=threaded",
+    );
+    const uring_fixed: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 1 };
+    if (std.Io.Evented == std.Io.Uring and builtin.zig_version.order(uring_fixed) == .lt) @compileError(
+        "-Dio=evented is broken in Zig 0.16.0: std.Io.Uring itself fails to compile because " ++
+            "error.ReadOnlyFileSystem is missing from Dir.OpenError and Dir.RealPathFileError. " ++
+            "This is an upstream standard library bug, not a zaytracer bug. Use -Dio=threaded.",
+    );
+}
 
 // ============================================================================
 // Math Utilities
@@ -1802,9 +1865,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    var io_backend: IoBackend = undefined;
+    try io_backend.init(allocator);
+    defer io_backend.deinit();
+    const io = io_backend.io();
 
     // Random number generator for scene generation
     var scene_prng = std.Random.DefaultPrng.init(0);

@@ -8,6 +8,9 @@
 # Multithreading flag (can be overridden: make build MULTITHREAD=false)
 MULTITHREAD ?= true
 
+# std.Io implementation: threaded, single_threaded, evented
+IO ?= threaded
+
 # Preview quality settings (fast iteration)
 PREVIEW_WIDTH ?= 400
 PREVIEW_SAMPLES ?= 10
@@ -49,24 +52,26 @@ help:
 	@echo ""
 	@echo "Build options:"
 	@echo "  MULTITHREAD=true/false  - Enable/disable multithreading (default: true)"
+	@echo "  IO=threaded|single_threaded|evented - std.Io implementation (default: threaded)"
 	@echo "  Examples:"
 	@echo "    make build MULTITHREAD=false       # Single-threaded debug build"
 	@echo "    make run-release MULTITHREAD=false # Single-threaded release run"
+	@echo "    make preview IO=single_threaded    # Preview using the single-threaded Io"
 
 # Build targets
 build: build-debug
 
 build-debug:
 	@echo "Building in Debug mode (multithreaded=$(MULTITHREAD))..."
-	zig build -Dmultithreading=$(MULTITHREAD)
+	zig build -Dmultithreading=$(MULTITHREAD) -Dio=$(IO)
 
 build-release:
 	@echo "Building in ReleaseFast mode (multithreaded=$(MULTITHREAD))..."
-	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD)
+	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD) -Dio=$(IO)
 
 build-preview:
 	@echo "Building PREVIEW mode ($(PREVIEW_WIDTH)px, $(PREVIEW_SAMPLES) samples)..."
-	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD) -Dwidth=$(PREVIEW_WIDTH) -Dsamples=$(PREVIEW_SAMPLES)
+	zig build -Doptimize=ReleaseFast -Dmultithreading=$(MULTITHREAD) -Dwidth=$(PREVIEW_WIDTH) -Dsamples=$(PREVIEW_SAMPLES) -Dio=$(IO)
 
 # Run targets
 run: run-debug

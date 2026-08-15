@@ -43,6 +43,47 @@ zig build run
 
 This will generate an `image.ppm` file in the current directory.
 
+## Build Options
+
+All options are compile-time and passed with `-D`:
+
+| Option | Values | Default | Description |
+| --- | --- | --- | --- |
+| `-Dwidth` | integer | `1200` | Image width in pixels |
+| `-Dsamples` | integer | `100` | Samples per pixel (antialiasing) |
+| `-Dmultithreading` | `true`/`false` | `true` | Tile-based multithreaded rendering |
+| `-Dio` | `threaded`, `single_threaded`, `evented` | `threaded` | Which `std.Io` implementation to use |
+
+```bash
+# Fast preview
+zig build run -Doptimize=ReleaseFast -Dwidth=400 -Dsamples=10
+
+# Single-threaded, deterministic output
+zig build run -Doptimize=ReleaseFast -Dmultithreading=false
+
+# Select the Io implementation
+zig build run -Dio=single_threaded
+```
+
+### About `-Dio`
+
+`std.Io` is an interface, so the backing implementation is selectable:
+
+- **`threaded`** (default) — `std.Io.Threaded` with a thread pool. Supports
+  `Io.async`/`Io.concurrent`.
+- **`single_threaded`** — `std.Io.Threaded.init_single_threaded`. No concurrency
+  support, but blocking file I/O and the futex-based `Io.Mutex` still work, so
+  it remains correct even with `-Dmultithreading=true`.
+- **`evented`** — `std.Io.Evented` (io_uring on Linux, kqueue on BSD, Dispatch
+  on Darwin). **Does not compile on Zig 0.16.0** due to an upstream bug where
+  `error.ReadOnlyFileSystem` is missing from `Dir.OpenError` and
+  `Dir.RealPathFileError` in `std.Io.Uring`. Selecting it produces an explicit
+  error explaining this rather than confusing standard library errors.
+
+The Io implementation does not affect rendered output. With
+`-Dmultithreading=false` (deterministic), `threaded` and `single_threaded`
+produce byte-identical images.
+
 ## Viewing the Output
 
 The raytracer outputs PPM format images. You can view them with:

@@ -11,10 +11,15 @@ pub fn build(b: *std.Build) void {
     const image_width = b.option(u32, "width", "Image width in pixels (default: 1200)") orelse 1200;
     const samples_per_pixel = b.option(u32, "samples", "Samples per pixel for antialiasing (default: 100)") orelse 100;
 
+    // Which std.Io implementation to use for file I/O and synchronization
+    const IoImpl = enum { threaded, single_threaded, evented };
+    const io_impl = b.option(IoImpl, "io", "Io implementation: threaded (default), single_threaded, evented") orelse .threaded;
+
     const options = b.addOptions();
     options.addOption(bool, "use_multithreading", multithreading);
     options.addOption(u32, "image_width", image_width);
     options.addOption(u32, "samples_per_pixel", samples_per_pixel);
+    options.addOption(IoImpl, "io_impl", io_impl);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
