@@ -8,10 +8,12 @@ This project implements a complete raytracer from scratch, building up features 
 - PPM image output
 - Vector mathematics (Vec3)
 - Ray-sphere intersection
-- Surface normals and materials (Lambertian, metal, dielectric)
+- Surface normals and materials (Lambertian, metal, dielectric, emissive)
 - Antialiasing with multisampling
 - Positionable camera with depth of field
-- Final scene with hundreds of spheres
+- Triangle meshes loaded from OBJ, accelerated with a BVH
+- Area lights sampled directly, and caustics from a photon map
+- Several scenes, selected at run time
 
 ## Development Environment
 
@@ -43,9 +45,66 @@ zig build run
 
 This will generate an `image.ppm` file in the current directory.
 
+## Scenes
+
+The scene is chosen at run time, so switching between them costs no rebuild:
+
+```bash
+zig build run -- --scene=cornell-box
+./zig-out/bin/zaytracer --list-scenes
+make preview SCENE=cornell-box
+```
+
+| Scene | Needs | Description |
+| --- | --- | --- |
+| `cover` (default) | committed models | The book's cover: random spheres, a diamond teapot and a cube, under a sky |
+| `cornell-box` | nothing | The closed Cornell box, lit only by a panel set into its ceiling, with a glass and a metal sphere |
+| `glass-dragon` | `make models` | The XYZ RGB Asian Dragon in glass, 249,882 triangles, lit by a panel against a dark sky |
+
+Without `--scene` the cover scene is rendered, which is also what CI renders,
+so the default must never depend on a fetched model.
+
+Two things a scene decides for itself, beyond geometry:
+
+- **Its background.** `cornell-box` is only closed because its background is
+  black; with the sky gradient, daylight would pour in through the open wall
+  the camera looks through.
+- **Its photon budget.** A closed room turns about 41% of emitted photons into
+  stored caustic photons, against roughly 7% for the open cover scene, so one
+  global budget does not fit both.
+
+## Models
+
+`models/` holds two small models outright: `test_cube.obj` and `teapot.obj`.
+Anything larger is fetched rather than committed:
+
+```bash
+make models          # fetch what is missing, verifying each sha256
+make models-verify   # re-check what is already there
+```
+
+`models/manifest.tsv` lists a filename, a URL and the sha256 of the file's
+bytes. Downloads land in a `.part` file and are only moved into place once the
+checksum matches, so a failed or corrupted fetch never leaves behind something
+that looks like a model. Sources are pinned to a commit, not a branch.
+
+Note that this sha256 is of the file itself, which is **not** the SHA the
+GitHub API reports for a blob — that one is `sha1("blob <len>\0" + content)`.
+Comparing against the wrong one fails every time.
+
+Fetched models are gitignored. The Stanford-derived ones (the dragon and the
+bunny) are for research and non-commercial use with attribution to the
+[Stanford Computer Graphics Laboratory](https://graphics.stanford.edu/data/3Dscanrep/),
+which is a good reason to link to them rather than redistribute them. They are
+served from
+[alecjacobson/common-3d-test-models](https://github.com/alecjacobson/common-3d-test-models),
+which carries the classic test models already converted to OBJ.
+
 ## Build Options
 
-All options are compile-time and passed with `-D`:
+Image size, sample count, multithreading and the `std.Io` backend are
+compile-time and passed with `-D`. The scene is not: it is an argument, so
+`--scene` needs no rebuild.
 
 | Option | Values | Default | Description |
 | --- | --- | --- | --- |
@@ -63,6 +122,9 @@ zig build run -Doptimize=ReleaseFast -Dmultithreading=false
 
 # Select the Io implementation
 zig build run -Dio=single_threaded
+
+# A different scene, at preview quality
+zig build run -Doptimize=ReleaseFast -Dwidth=400 -Dsamples=10 -- --scene=glass-dragon
 ```
 
 ### About `-Dio`
@@ -140,29 +202,85 @@ is a normal make rule, so re-viewing an unchanged render does not reconvert it.
 - Monolithic `main.zig` structure following the book's progression
 - Optimized with ReleaseFast for performance
 
+### Lighting
+
+There are two ways light reaches the camera, and they must not overlap:
+
+- **Direct sampling.** At every diffuse hit, each area light is sampled and a
+  shadow ray is fired at it. Waiting for a bounce to stumble onto a panel that
+  covers 9% of a ceiling is almost pure noise. Point lights are not sampled
+  this way: they exist only to drive the caustic map, and always have.
+- **Emissive geometry.** A `diffuse_light` material emits and scatters nothing.
+  It emits from one face only — the one its geometry's normal points out of —
+  because a lamp hung a few centimetres below a ceiling would otherwise light
+  the gap above itself across almost no distance, and direct sampling divides
+  by the square of that distance.
+
+Emission is counted only while a path has been specular the whole way from the
+camera: looking at the lamp, at its reflection, or at it through glass. Once a
+path touches a diffuse surface, direct sampling has covered that light and the
+caustic map covers it arriving through anything specular further on, so
+counting it again would be both too bright and violently noisy — finding a
+small lamp by chance through a specular bounce is exactly the rare,
+high-energy sample that shows up as a white speck. Without a photon map
+nothing covers specular paths, so there emission is counted and the renderer
+degrades to plain path tracing.
+
 ### Caustics
 
 Caustics come from a photon map built before rendering, on top of the path
 tracer rather than inside it:
 
-- Photons are emitted from the point light and stored where they land on a
+- Photons are emitted from a single light and stored where they land on a
   diffuse surface *after* at least one specular bounce (an `LS+D` path). A
   photon that reaches a diffuse surface directly is direct light rather than a
   caustic, and is dropped: storing it made this a global photon map whose
-  energy was added on top of the path traced result. The renderer has no
-  direct-lighting term for the point light, so the lamp contributes caustics
-  only and everything else is lit by the sky.
+  energy was added on top of the path traced result. A photon that strikes a
+  lamp is absorbed, since the emission already accounts for it.
 - Emission is aimed with a projection map — a coarse grid of directions around
   the light that probes which ones reach specular geometry. Photon power is
   scaled by the fraction of the sphere those directions cover, so aiming
   redistributes the light's power without adding energy.
+- Area lights emit their photons from a single point at their centre. This is
+  an approximation an area light does not really deserve, but it keeps the
+  projection map and the emission pass unchanged.
 - Gathering is a fixed-radius density estimate scaled by the Lambertian BRDF
   (`albedo / pi`), so a caustic takes on the colour of the surface it lands on.
 
+The grid the photons are looked up in is sized from the scene rather than
+hardcoded. Using the scene's own bounding box is not enough: the cover scene's
+ground is a sphere of radius 1000, so that box spans 2000 units and each of the
+128 cells per axis would be about 15 across, against a gather radius of 0.2.
+Since photons are only stored after a specular bounce, the box is anchored on
+the specular geometry, grown to at least 32 units to catch the splash around
+it, and clipped to the scene — unless the whole scene already fits, in which
+case it is covered entirely, because a closed room throws caustics onto its
+walls too. Photons landing outside the box are reported rather than silently
+dropped.
+
 The tuning constants (`photons_emitted`, `caustic_gather_radius`,
-`photon_grid_size`, ...) sit together above `PhotonMap` in `src/main.zig`. The
-photon pass is deterministic; multithreaded rendering is not, so use
-`-Dmultithreading=false` when comparing two renders.
+`photon_grid_size`, `min_photon_extent`, ...) sit together above `PhotonMap` in
+`src/main.zig`, and a scene can override the budget. The photon pass is
+deterministic; multithreaded rendering is not, so use `-Dmultithreading=false`
+when comparing two renders.
+
+### Cost
+
+Stage timings at 500x281 and 80 samples on 16 threads, which is what the
+`Scene built` / `BVH built` / `caustic pass` / `Rendered in` lines report:
+
+| Scene | Primitives | Scene build | BVH build | Caustics | Render |
+| --- | --- | --- | --- | --- | --- |
+| `cover` | 6,817 | 3.7ms | 21.0ms | 705.9ms | 3.7s |
+| `cornell-box` | 20 | 42.9us | 21.0us | 447.0ms | 3m15s |
+| `glass-dragon` | 249,886 | 175.9ms | 3.6s | 12.6s | 13.7s |
+
+Parsing 11.3 MB of OBJ and generating smooth normals for a quarter of a million
+triangles costs 176ms, which is nothing. The BVH build is the one to watch:
+3.6s, single-threaded, and the reason the dragon takes longer to set up than to
+render. The closed Cornell box is the surprise — 20 primitives and by far the
+slowest render, because no path ever escapes it and every one runs the full 50
+bounces.
 
 ## References
 

@@ -111,7 +111,7 @@ run-release: build-release
 preview: build-preview
 	@echo "========================================="
 	@echo "   PREVIEW MODE (Fast Iteration)"
-	@echo "   Resolution: $(PREVIEW_WIDTH)x$$(echo "$(PREVIEW_WIDTH) / 16 * 9" | bc)"
+	@echo "   Width: $(PREVIEW_WIDTH)px (the scene picks the aspect ratio)"
 	@echo "   Samples: $(PREVIEW_SAMPLES)"
 	@echo "========================================="
 	@echo ""
