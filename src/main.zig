@@ -310,9 +310,14 @@ const Material = struct {
     }
 
     /// Light leaving the surface on its own account, before anything bounces.
-    pub fn emitted(self: Material) Color {
+    ///
+    /// One-sided: only the face the geometric normal points out of emits. A
+    /// panel hung below a ceiling would otherwise light the gap above it from
+    /// a few centimetres away, and direct sampling divides by the square of
+    /// that distance.
+    pub fn emitted(self: Material, front_face: bool) Color {
         return switch (self.material_type) {
-            .diffuse_light => self.emission,
+            .diffuse_light => if (front_face) self.emission else Color{ 0, 0, 0 },
             .lambertian, .metal, .dielectric => Color{ 0, 0, 0 },
         };
     }
@@ -368,13 +373,25 @@ const Material = struct {
 
 const LightType = enum {
     point,
+    quad,
 };
 
 const Light = struct {
     light_type: LightType,
+    /// Where the photon pass emits from. For a quad that is its centre: the
+    /// caustic map is built from a point source even when the light has area.
     position: Point3,
     intensity: Color,
     power: f64,
+
+    /// Quad only: a corner of the emitting rectangle and its two edges.
+    corner: Point3 = Point3{ 0, 0, 0 },
+    edge_u: Vec3 = Vec3{ 0, 0, 0 },
+    edge_v: Vec3 = Vec3{ 0, 0, 0 },
+    /// Quad only: radiance leaving the surface. Should match the emission of
+    /// the diffuse_light material on the quad's own geometry, or the lamp will
+    /// not look as bright as the light it casts.
+    emission: Color = Color{ 0, 0, 0 },
 
     pub fn pointLight(position: Point3, intensity: Color, power: f64) Light {
         return Light{
@@ -383,6 +400,97 @@ const Light = struct {
             .intensity = intensity,
             .power = power,
         };
+    }
+
+    /// A rectangular area light spanning `corner + s*edge_u + t*edge_v` for
+    /// s, t in [0, 1], emitting from the face `edge_u x edge_v` points out of.
+    /// Pass the same corner and edges to `SceneData.addQuad` and the lamp's
+    /// geometry will face the same way as the light it stands for.
+    ///
+    /// `emission` is the radiance leaving the surface; the flux the caustic
+    /// pass emits is derived from it, so the lamp's brightness and the caustics
+    /// it throws cannot drift apart.
+    pub fn quadLight(corner: Point3, edge_u: Vec3, edge_v: Vec3, emission: Color) Light {
+        const brightest = @max(@max(emission[0], emission[1]), emission[2]);
+        const hue = if (brightest > 0.0) div(emission, brightest) else Color{ 1, 1, 1 };
+        const quad_area = length(cross(edge_u, edge_v));
+
+        return Light{
+            .light_type = .quad,
+            .position = add(corner, mul(add(edge_u, edge_v), 0.5)),
+            .intensity = hue,
+            // Radiant flux of a lambertian emitter: radiance x area x pi.
+            .power = std.math.pi * quad_area * brightest,
+            .corner = corner,
+            .edge_u = edge_u,
+            .edge_v = edge_v,
+            .emission = emission,
+        };
+    }
+
+    pub fn area(self: Light) f64 {
+        return switch (self.light_type) {
+            .point => 0.0,
+            .quad => length(cross(self.edge_u, self.edge_v)),
+        };
+    }
+
+    /// Light arriving straight from this source at a lambertian surface, found
+    /// by sampling the source rather than waiting for a bounce to stumble into
+    /// it. Without this a small lamp in a closed room is almost pure noise.
+    ///
+    /// Point lights return nothing: they exist only to drive the caustic map,
+    /// and always have. Making them cast direct light too would relight every
+    /// scene that uses one.
+    pub fn sampleDirect(
+        self: Light,
+        world: BVH,
+        point: Point3,
+        normal: Vec3,
+        albedo: Color,
+        rng: std.Random,
+    ) Color {
+        if (self.light_type != .quad) return Color{ 0, 0, 0 };
+
+        const on_light = add(add(
+            self.corner,
+            mul(self.edge_u, randomFloat(rng)),
+        ), mul(self.edge_v, randomFloat(rng)));
+
+        const to_light = sub(on_light, point);
+        const distance_squared = lengthSquared(to_light);
+        if (distance_squared <= 0.0) return Color{ 0, 0, 0 };
+
+        const distance = @sqrt(distance_squared);
+        const direction = div(to_light, distance);
+
+        const cos_surface = dot(normal, direction);
+        if (cos_surface <= 0.0) return Color{ 0, 0, 0 };
+
+        // One-sided, matching the diffuse_light material: the emitting face is
+        // the one the quad's normal points out of, which for a ceiling panel is
+        // downwards. Without this a point on the ceiling a few centimetres
+        // above the panel samples it across almost no distance at all, and the
+        // 1/d^2 below turns into a white speck that no amount of sampling
+        // averages away.
+        const light_normal = unitVector(cross(self.edge_u, self.edge_v));
+        const cos_light = -dot(light_normal, direction);
+        if (cos_light <= 1e-8) return Color{ 0, 0, 0 };
+
+        // Stop short of the light itself, or the lamp shadows its own surface.
+        var occluder: HitRecord = undefined;
+        if (world.hit(
+            Ray.init(point, direction),
+            Interval{ .min = 0.001, .max = distance - 0.001 },
+            &occluder,
+        )) {
+            return Color{ 0, 0, 0 };
+        }
+
+        // Lambertian BRDF (albedo/pi) times the geometry term that converts the
+        // area sample into a solid angle.
+        const geometry = cos_surface * cos_light * self.area() / distance_squared;
+        return mulVec(mul(albedo, geometry / std.math.pi), self.emission);
     }
 };
 
@@ -1008,6 +1116,15 @@ const photons_emitted: u32 = 1_000_000;
 /// the emitted photons complete such a path, so this is well below the number
 /// emitted.
 const photon_map_capacity: usize = 200_000;
+
+/// How much of the photon budget a scene wants. The defaults suit an open,
+/// sky-lit scene where most emitted photons escape; a closed room converts a
+/// far larger share of them into stored caustic photons and needs a different
+/// balance, so this is a scene's to choose.
+const PhotonBudget = struct {
+    emitted: u32 = photons_emitted,
+    capacity: usize = photon_map_capacity,
+};
 /// Cells per axis in the photon lookup grid. Sized so a cell is roughly the
 /// gather radius: too coarse and every gather walks thousands of photons.
 const photon_grid_size: u32 = 128;
@@ -1074,23 +1191,33 @@ fn derivePhotonBounds(primitives: []const Primitive, scene_box: AABB) PhotonBoun
         const room = scene.size();
         const bounded = room > 0.0 and std.math.isFinite(room);
 
-        const size = if (bounded) @min(@max(anchor.size(), min_photon_extent), room) else min_photon_extent;
+        // Never narrower than the specular geometry, and wide enough to catch
+        // the splash around it.
+        const size = @max(anchor.size(), min_photon_extent);
 
-        var lo = center - size / 2.0;
-        var hi = center + size / 2.0;
+        if (bounded and room <= size) {
+            // The whole scene fits in the grid, so cover all of it: a closed
+            // room throws caustics onto its walls, not just onto the floor
+            // under the glass.
+            min[axis] = scene.min;
+            max[axis] = scene.max;
+        } else {
+            var lo = center - size / 2.0;
+            var hi = center + size / 2.0;
 
-        // Clip to the scene rather than sliding the window back inside it. The
-        // window is centred on the specular geometry and never narrower, so
-        // clipping cannot cut any of it off, and it keeps the box from
-        // stretching tens of units into the empty space under a ground sphere
-        // just to preserve a nominal extent.
-        if (bounded) {
-            lo = @max(lo, scene.min);
-            hi = @min(hi, scene.max);
+            // Clip to the scene rather than sliding the window back inside it.
+            // The window is centred on the specular geometry and never
+            // narrower, so clipping cannot cut any of it off, and it keeps the
+            // box from stretching tens of units into the empty space under a
+            // ground sphere just to preserve a nominal extent.
+            if (bounded) {
+                lo = @max(lo, scene.min);
+                hi = @min(hi, scene.max);
+            }
+
+            min[axis] = lo;
+            max[axis] = hi;
         }
-
-        min[axis] = lo;
-        max[axis] = hi;
     }
 
     return PhotonBounds{ .min = min, .max = max };
@@ -1894,9 +2021,29 @@ const RenderContext = struct {
     world: BVH,
     background: Background = .sky,
     photon_map: ?*const PhotonMap = null,
+    lights: []const Light = &.{},
 };
 
 fn rayColor(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random) Color {
+    // A camera ray sees emitters directly: nothing has sampled them yet.
+    return rayColorInner(ctx, ray, depth, rng, true);
+}
+
+/// `count_emission` says whether hitting a light should add its emission.
+///
+/// It must not, once the path has touched a diffuse surface. Two other
+/// estimators already cover the light from there: direct sampling handles the
+/// light seen straight from that surface, and the caustic map handles it seen
+/// through glass or off metal. Letting the bounce count emission as well would
+/// add both a second time — which is not only too bright but violently noisy,
+/// since finding a small lamp by chance through a specular bounce is exactly
+/// the rare, high-energy sample that shows up as a white speck.
+///
+/// So emission counts only while the path has been specular the whole way from
+/// the camera: looking at the lamp, or at its reflection, or at it through
+/// glass. Without a photon map nothing else covers specular paths, so there
+/// they are counted and the renderer degrades to plain path tracing.
+fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, count_emission: bool) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
         return Color{ 0, 0, 0 };
@@ -1908,26 +2055,52 @@ fn rayColor(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random) Color {
         var scattered: Ray = undefined;
         var attenuation: Color = undefined;
 
-        const emitted = rec.material.emitted();
+        const emitted = if (count_emission) rec.material.emitted(rec.front_face) else Color{ 0, 0, 0 };
 
-        // Add caustics contribution for diffuse surfaces
+        var direct = Color{ 0, 0, 0 };
         var caustics_contribution = Color{ 0, 0, 0 };
-        if (rec.material.material_type == .lambertian and ctx.photon_map != null) {
-            // The map holds LS+D photons only, so this adds the caustics the
-            // recursive estimate below cannot find, and nothing it can.
-            caustics_contribution = ctx.photon_map.?.estimateRadiance(
-                rec.point,
-                rec.normal,
-                rec.material.albedo,
-                caustic_gather_radius,
-            );
+
+        if (rec.material.material_type == .lambertian) {
+            for (ctx.lights) |light| {
+                direct = add(direct, light.sampleDirect(
+                    ctx.world,
+                    rec.point,
+                    rec.normal,
+                    rec.material.albedo,
+                    rng,
+                ));
+            }
+
+            if (ctx.photon_map) |map| {
+                // The map holds LS+D photons only, so this adds the caustics the
+                // recursive estimate below cannot find, and nothing it can.
+                caustics_contribution = map.estimateRadiance(
+                    rec.point,
+                    rec.normal,
+                    rec.material.albedo,
+                    caustic_gather_radius,
+                );
+            }
         }
+
+        const local = add(add(emitted, direct), caustics_contribution);
 
         if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
-            const indirect = rayColor(ctx, scattered, depth - 1, rng);
-            return add(add(emitted, mulVec(attenuation, indirect)), caustics_contribution);
+            const bounce_counts_emission = if (!isSpecular(rec.material.material_type))
+                // Direct sampling covered the light here, and the caustic map
+                // covers it arriving through anything specular further on.
+                false
+            else if (ctx.photon_map == null)
+                // No caustic map: plain path tracing, where the bounce landing
+                // on a light is the only way that light ever arrives.
+                true
+            else
+                count_emission;
+
+            const indirect = rayColorInner(ctx, scattered, depth - 1, rng, bounce_counts_emission);
+            return add(local, mulVec(attenuation, indirect));
         }
-        return add(emitted, caustics_contribution);
+        return local;
     }
 
     return ctx.background.sample(ray.direction);
@@ -2060,6 +2233,7 @@ const SceneData = struct {
     lights: std.ArrayList(Light),
     camera: CameraSpec,
     background: Background,
+    photons: PhotonBudget,
 
     pub fn init(allocator: std.mem.Allocator, camera: CameraSpec) SceneData {
         return SceneData{
@@ -2068,6 +2242,7 @@ const SceneData = struct {
             .lights = .empty,
             .camera = camera,
             .background = .sky,
+            .photons = .{},
         };
     }
 
@@ -2078,6 +2253,18 @@ const SceneData = struct {
 
     pub fn addSphere(self: *SceneData, sphere: Sphere) !void {
         try self.primitives.append(self.allocator, Primitive{ .sphere = sphere });
+    }
+
+    /// A rectangle as two triangles, spanning `corner + s*edge_u + t*edge_v`
+    /// for s, t in [0, 1].
+    pub fn addQuad(self: *SceneData, corner: Point3, edge_u: Vec3, edge_v: Vec3, material: Material) !void {
+        const a = corner;
+        const b = add(corner, edge_u);
+        const c = add(add(corner, edge_u), edge_v);
+        const d = add(corner, edge_v);
+
+        try self.primitives.append(self.allocator, Primitive{ .triangle = Triangle.init(a, b, c, material) });
+        try self.primitives.append(self.allocator, Primitive{ .triangle = Triangle.init(a, c, d, material) });
     }
 
     pub fn addLight(self: *SceneData, light: Light) !void {
@@ -2111,6 +2298,11 @@ const scenes = [_]Scene{
         .name = "cover",
         .description = "Ray Tracing in One Weekend cover: random spheres, a diamond teapot and a cube",
         .build = buildCoverScene,
+    },
+    .{
+        .name = "cornell-box",
+        .description = "Closed Cornell box lit by a ceiling panel, with a glass and a metal sphere",
+        .build = buildCornellBoxScene,
     },
 };
 
@@ -2228,6 +2420,85 @@ fn buildCoverScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
         Color{ 1.0, 1.0, 1.0 }, // White light
         1000.0, // Power
     ));
+
+    return scene;
+}
+
+/// The Cornell box, closed on five sides and lit only by the panel on its
+/// ceiling. This is the scene the caustic map was built for: an open, sky-lit
+/// field washes a caustic out, while a sealed room has nothing else to look at.
+///
+/// Dimensions follow the original measurements scaled to a 5.55-unit cube, and
+/// the sixth wall is left off for the camera to look through. The background is
+/// black, because a "closed" box that lets the sky in through that opening is
+/// not closed at all.
+fn buildCornellBoxScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    _ = io;
+
+    const size = 5.55;
+
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ size / 2.0, size / 2.0, -8.0 },
+        .lookat = Point3{ size / 2.0, size / 2.0, size / 2.0 },
+        .vfov = 38.0,
+        // The box is square, so anything wider just frames it in black.
+        .aspect_ratio = 1.0,
+    });
+    errdefer scene.deinit();
+
+    scene.background = .{ .solid = Color{ 0, 0, 0 } };
+    // A closed room turns ~41% of emitted photons into stored caustic photons,
+    // against ~7% for the open cover scene, so the map needs the extra room.
+    scene.photons = .{ .emitted = 1_000_000, .capacity = 500_000 };
+
+    const white = Material.lambertian(Color{ 0.73, 0.73, 0.73 });
+    const red = Material.lambertian(Color{ 0.65, 0.05, 0.05 });
+    const green = Material.lambertian(Color{ 0.12, 0.45, 0.15 });
+
+    const x = Vec3{ size, 0, 0 };
+    const y = Vec3{ 0, size, 0 };
+    const z = Vec3{ 0, 0, size };
+
+    try scene.addQuad(Point3{ 0, 0, 0 }, x, z, white); // floor
+    try scene.addQuad(Point3{ 0, 0, size }, x, y, white); // back wall
+
+    // The camera looks along +z, which puts +x on the left of the image, so
+    // green goes on the x = 0 wall to land red on the left as in the original.
+    try scene.addQuad(Point3{ 0, 0, 0 }, y, z, green);
+    try scene.addQuad(Point3{ size, 0, 0 }, y, z, red);
+
+    // The panel is set into the ceiling rather than hung below it. Hanging it
+    // leaves a sliver of ceiling a few centimetres away that samples the light
+    // across almost no distance, and direct lighting divides by the square of
+    // that distance. Set into the opening the two are coplanar, every direction
+    // from the ceiling to the panel is edge-on, and the term vanishes instead
+    // of exploding.
+    const panel_x0 = 1.925;
+    const panel_z0 = 1.925;
+    const panel_side = 1.7;
+    const panel_x1 = panel_x0 + panel_side;
+    const panel_z1 = panel_z0 + panel_side;
+
+    // Ceiling, as four strips around the opening.
+    try scene.addQuad(Point3{ 0, size, 0 }, x, Vec3{ 0, 0, panel_z0 }, white);
+    try scene.addQuad(Point3{ 0, size, panel_z1 }, x, Vec3{ 0, 0, size - panel_z1 }, white);
+    try scene.addQuad(Point3{ 0, size, panel_z0 }, Vec3{ panel_x0, 0, 0 }, Vec3{ 0, 0, panel_side }, white);
+    try scene.addQuad(Point3{ panel_x1, size, panel_z0 }, Vec3{ size - panel_x1, 0, 0 }, Vec3{ 0, 0, panel_side }, white);
+
+    const emission = Color{ 15.0, 15.0, 15.0 };
+    const panel_corner = Point3{ panel_x0, size, panel_z0 };
+    const panel_u = Vec3{ panel_side, 0, 0 };
+    const panel_v = Vec3{ 0, 0, panel_side };
+
+    // Same corner and edges for both, so the lamp faces the way the light says
+    // it does: edge_u x edge_v points down into the room.
+    try scene.addQuad(panel_corner, panel_u, panel_v, Material.diffuseLight(Color{ 1, 1, 1 }, 15.0));
+    try scene.addLight(Light.quadLight(panel_corner, panel_u, panel_v, emission));
+
+    // Glass focuses the panel into a caustic on the floor; the metal sphere is
+    // there to bounce it around the room.
+    try scene.addSphere(Sphere.init(Point3{ 1.85, 1.0, 2.6 }, 1.0, Material.dielectric(1.5)));
+    try scene.addSphere(Sphere.init(Point3{ 3.9, 0.8, 3.7 }, 0.8, Material.metal(Color{ 0.8, 0.85, 0.88 }, 0.0)));
 
     return scene;
 }
@@ -2534,7 +2805,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     var photon_map = try PhotonMap.init(
         allocator,
-        photon_map_capacity,
+        scene.photons.capacity,
         photon_bounds.min,
         photon_bounds.max,
         photon_grid_size,
@@ -2560,12 +2831,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .{ projection.cells.len, ProjectionMap.cell_count, projection.sphereFraction() * 100.0 },
         );
 
-        const photon_count = emitPhotonsFromLight(light, world, &photon_map, photons_emitted, projection, photon_rng);
-        std.debug.print("Emitted {d} photons, stored {d} caustic photons\n", .{ photons_emitted, photon_count });
-        if (photon_count >= photon_map_capacity) {
+        const photon_count = emitPhotonsFromLight(light, world, &photon_map, scene.photons.emitted, projection, photon_rng);
+        std.debug.print("Emitted {d} photons, stored {d} caustic photons\n", .{ scene.photons.emitted, photon_count });
+        if (photon_count >= scene.photons.capacity) {
             // Emission stops once the map is full, so the remaining photons never
             // get traced and the caustics are missing that share of the light.
-            std.debug.print("Warning: photon map hit its capacity of {d}; raise photon_map_capacity\n", .{photon_map_capacity});
+            std.debug.print("Warning: photon map hit its capacity of {d}; the caustics are missing the light that was never emitted\n", .{scene.photons.capacity});
         }
 
         // Build spatial grid for fast photon queries
@@ -2584,6 +2855,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .world = world,
         .background = scene.background,
         .photon_map = &photon_map,
+        .lights = scene.lights.items,
     };
 
     const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
