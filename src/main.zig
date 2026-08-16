@@ -1619,9 +1619,15 @@ const OBJData = struct {
     vertices: []Vec3,
     normals: []Vec3,
     faces: []Face,
+    mtllibs: []const []const u8,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: OBJData) void {
+        for (self.faces) |face| {
+            if (face.material_name) |name| self.allocator.free(name);
+        }
+        for (self.mtllibs) |name| self.allocator.free(name);
+        self.allocator.free(self.mtllibs);
         self.allocator.free(self.vertices);
         self.allocator.free(self.normals);
         self.allocator.free(self.faces);
@@ -1638,6 +1644,8 @@ const Face = struct {
     n0: u32,
     n1: u32,
     n2: u32,
+
+    material_name: ?[]const u8,
 
     pub fn hasNormals(self: Face) bool {
         return self.n0 != 0xFFFFFFFF and
@@ -1660,6 +1668,131 @@ fn parseOBJ(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !OBJ
     return parseOBJText(allocator, contents);
 }
 
+const MTLData = struct {
+    materials: []MTLEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: MTLData) void {
+        for (self.materials) |material| self.allocator.free(material.name);
+        self.allocator.free(self.materials);
+    }
+};
+
+const MTLEntry = struct {
+    name: []const u8,
+    kd: Color = Color{ 0.8, 0.8, 0.8 },
+    ks: Color = Color{ 0.0, 0.0, 0.0 },
+    ns: f64 = 0.0,
+    ni: f64 = 1.5,
+    opacity: f64 = 1.0,
+    illum: u32 = 2,
+};
+
+fn parseMTL(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !MTLData {
+    const max_file_size = 10 * 1024 * 1024;
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
+    defer allocator.free(contents);
+
+    return parseMTLText(allocator, contents);
+}
+
+fn finishMTLEntry(materials: *std.ArrayList(MTLEntry), current: *?MTLEntry, allocator: std.mem.Allocator) !void {
+    if (current.*) |entry| {
+        try materials.append(allocator, entry);
+        current.* = null;
+    }
+}
+
+/// parse the useful subset of Wavefront MTL from in-memory text. Textures and
+/// vendor extensions are ignored because this renderer has only analytic
+/// material parameters to feed, not UV sampling or image storage.
+fn parseMTLText(allocator: std.mem.Allocator, contents: []const u8) !MTLData {
+    var materials = try std.ArrayList(MTLEntry).initCapacity(allocator, 8);
+    defer materials.deinit(allocator);
+    errdefer {
+        for (materials.items) |material| allocator.free(material.name);
+    }
+
+    var current: ?MTLEntry = null;
+    errdefer if (current) |entry| allocator.free(entry.name);
+
+    var line_iter = std.mem.splitScalar(u8, contents, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        var iter = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const keyword = iter.next() orelse continue;
+
+        if (std.mem.eql(u8, keyword, "newmtl")) {
+            try finishMTLEntry(&materials, &current, allocator);
+            const name = iter.next() orelse return error.InvalidFormat;
+            current = MTLEntry{ .name = try allocator.dupe(u8, name) };
+        } else if (current) |*entry| {
+            if (std.mem.eql(u8, keyword, "Kd")) {
+                entry.kd = try parseMTLColor(&iter);
+            } else if (std.mem.eql(u8, keyword, "Ks")) {
+                entry.ks = try parseMTLColor(&iter);
+            } else if (std.mem.eql(u8, keyword, "Ns")) {
+                entry.ns = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+            } else if (std.mem.eql(u8, keyword, "Ni")) {
+                entry.ni = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+            } else if (std.mem.eql(u8, keyword, "d")) {
+                entry.opacity = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+            } else if (std.mem.eql(u8, keyword, "Tr")) {
+                const transparency = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+                entry.opacity = 1.0 - transparency;
+            } else if (std.mem.eql(u8, keyword, "illum")) {
+                entry.illum = try std.fmt.parseInt(u32, iter.next() orelse return error.InvalidFormat, 10);
+            }
+        }
+    }
+
+    try finishMTLEntry(&materials, &current, allocator);
+
+    return MTLData{
+        .materials = try materials.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+fn parseMTLColor(iter: *std.mem.TokenIterator(u8, .any)) !Color {
+    const r = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+    const g = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+    const b = try std.fmt.parseFloat(f64, iter.next() orelse return error.InvalidFormat);
+    return Color{ r, g, b };
+}
+
+/// convert one Wavefront material to zaytracer's much smaller material model.
+///
+/// the mapping is deliberately lossy: alpha or glass-like illum modes become a
+/// dielectric using Ni, because the renderer has no tinted transparency; very
+/// shiny materials, or reflection illum modes, become metal, with bright Ks as
+/// colour and Ns compressed into fuzz; everything else is Lambertian diffuse Kd,
+/// preserving the most common OBJ use case.
+fn materialFromMTL(entry: MTLEntry) Material {
+    if (entry.opacity < 1.0 or entry.illum == 4 or entry.illum == 6 or entry.illum == 7) {
+        return Material.dielectric(if (entry.ni > 0.0) entry.ni else 1.5);
+    }
+
+    const ks_brightness = maxComponent(entry.ks);
+    if ((entry.ns >= 100.0 and ks_brightness >= 0.5) or entry.illum == 3 or entry.illum == 5) {
+        const albedo = if (ks_brightness > 0.0) entry.ks else entry.kd;
+        return Material.metal(albedo, metalFuzzFromNs(entry.ns));
+    }
+
+    return Material.lambertian(entry.kd);
+}
+
+fn maxComponent(v: Vec3) f64 {
+    return @max(@max(v[0], v[1]), v[2]);
+}
+
+fn metalFuzzFromNs(ns: f64) f64 {
+    if (!(ns > 0.0)) return 1.0;
+    return @min(1.0, @sqrt(2.0 / (ns + 2.0)));
+}
+
 /// The parser proper, split from reading the file so it can be tested against
 /// text held in memory. Tests that need a file on disk cannot run in CI, which
 /// never fetches a model, and would say more about the fixture than the parser.
@@ -1671,6 +1804,18 @@ fn parseOBJText(allocator: std.mem.Allocator, contents: []const u8) !OBJData {
     defer normals.deinit(allocator);
     var faces = try std.ArrayList(Face).initCapacity(allocator, 100);
     defer faces.deinit(allocator);
+    errdefer {
+        for (faces.items) |face| {
+            if (face.material_name) |name| allocator.free(name);
+        }
+    }
+    var mtllibs = try std.ArrayList([]const u8).initCapacity(allocator, 2);
+    defer mtllibs.deinit(allocator);
+    errdefer {
+        for (mtllibs.items) |name| allocator.free(name);
+    }
+
+    var current_material: ?[]const u8 = null;
 
     // Parse line by line
     var line_iter = std.mem.splitScalar(u8, contents, '\n');
@@ -1685,15 +1830,20 @@ fn parseOBJText(allocator: std.mem.Allocator, contents: []const u8) !OBJData {
         } else if (std.mem.startsWith(u8, trimmed, "f ")) {
             // Counts as they stand at this line, because a negative index
             // counts back from here rather than from the end of the file.
-            try parseFace(&faces, trimmed, allocator, vertices.items.len, normals.items.len);
+            try parseFace(&faces, trimmed, allocator, vertices.items.len, normals.items.len, current_material);
+        } else if (std.mem.startsWith(u8, trimmed, "usemtl ")) {
+            current_material = try parseUseMTL(trimmed);
+        } else if (std.mem.startsWith(u8, trimmed, "mtllib ")) {
+            try parseMTLLibs(&mtllibs, trimmed, allocator);
         }
-        // Ignore: vt (textures), mtllib, usemtl, s, o, g
+        // Ignore: vt (textures), s, o, g
     }
 
     return OBJData{
         .vertices = try vertices.toOwnedSlice(allocator),
         .normals = try normals.toOwnedSlice(allocator),
         .faces = try faces.toOwnedSlice(allocator),
+        .mtllibs = try mtllibs.toOwnedSlice(allocator),
         .allocator = allocator,
     };
 }
@@ -1730,12 +1880,51 @@ fn parseNormal(normals: *std.ArrayList(Vec3), line: []const u8, allocator: std.m
     try normals.append(allocator, Vec3{ x, y, z });
 }
 
+fn parseUseMTL(line: []const u8) ![]const u8 {
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    _ = iter.next();
+    return iter.next() orelse return error.InvalidFormat;
+}
+
+fn parseMTLLibs(mtllibs: *std.ArrayList([]const u8), line: []const u8, allocator: std.mem.Allocator) !void {
+    var iter = std.mem.tokenizeAny(u8, line, " \t");
+    _ = iter.next();
+
+    var found = false;
+    while (iter.next()) |name| {
+        const owned_name = try allocator.dupe(u8, name);
+        mtllibs.append(allocator, owned_name) catch |err| {
+            allocator.free(owned_name);
+            return err;
+        };
+        found = true;
+    }
+    if (!found) return error.InvalidFormat;
+}
+
+fn dupeOptionalMaterial(allocator: std.mem.Allocator, material_name: ?[]const u8) !?[]const u8 {
+    return if (material_name) |name| try allocator.dupe(u8, name) else null;
+}
+
+fn appendFaceWithMaterial(
+    faces: *std.ArrayList(Face),
+    allocator: std.mem.Allocator,
+    face: Face,
+    material_name: ?[]const u8,
+) !void {
+    var face_with_material = face;
+    face_with_material.material_name = try dupeOptionalMaterial(allocator, material_name);
+    errdefer if (face_with_material.material_name) |name| allocator.free(name);
+    try faces.append(allocator, face_with_material);
+}
+
 fn parseFace(
     faces: *std.ArrayList(Face),
     line: []const u8,
     allocator: std.mem.Allocator,
     vertices_so_far: usize,
     normals_so_far: usize,
+    material_name: ?[]const u8,
 ) !void {
     // Parse face: "f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3" (or variations)
     var iter = std.mem.tokenizeAny(u8, line, " \t");
@@ -1749,27 +1938,29 @@ fn parseFace(
     const v1_data = try parseVertexDescriptor(vert2, vertices_so_far, normals_so_far);
     const v2_data = try parseVertexDescriptor(vert3, vertices_so_far, normals_so_far);
 
-    try faces.append(allocator, Face{
+    try appendFaceWithMaterial(faces, allocator, Face{
         .v0 = v0_data.v,
         .v1 = v1_data.v,
         .v2 = v2_data.v,
         .n0 = v0_data.n,
         .n1 = v1_data.n,
         .n2 = v2_data.n,
-    });
+        .material_name = null,
+    }, material_name);
 
     // Triangulate if more than 3 vertices (simple fan from v0)
     var prev = v2_data;
     while (iter.next()) |vert| {
         const curr = try parseVertexDescriptor(vert, vertices_so_far, normals_so_far);
-        try faces.append(allocator, Face{
+        try appendFaceWithMaterial(faces, allocator, Face{
             .v0 = v0_data.v,
             .v1 = prev.v,
             .v2 = curr.v,
             .n0 = v0_data.n,
             .n1 = prev.n,
             .n2 = curr.n,
-        });
+            .material_name = null,
+        }, material_name);
         prev = curr;
     }
 }
@@ -1820,6 +2011,122 @@ fn parseVertexDescriptor(desc: []const u8, vertices_so_far: usize, normals_so_fa
     };
 }
 
+fn loadOBJMaterials(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    obj_filepath: []const u8,
+    mtllibs: []const []const u8,
+    materials: *std.StringHashMap(Material),
+    owned_names: *std.ArrayList([]const u8),
+) !void {
+    for (mtllibs) |mtllib| {
+        const material_path = try pathRelativeToObj(allocator, obj_filepath, mtllib);
+        defer allocator.free(material_path);
+
+        const mtl_data = try parseMTL(allocator, io, material_path);
+        defer mtl_data.deinit();
+
+        for (mtl_data.materials) |entry| {
+            if (materials.getPtr(entry.name)) |material| {
+                material.* = materialFromMTL(entry);
+            } else {
+                const name = try allocator.dupe(u8, entry.name);
+                errdefer allocator.free(name);
+                try materials.put(name, materialFromMTL(entry));
+                try owned_names.append(allocator, name);
+            }
+        }
+    }
+}
+
+fn pathRelativeToObj(allocator: std.mem.Allocator, obj_filepath: []const u8, sibling: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(sibling)) return allocator.dupe(u8, sibling);
+    if (std.fs.path.dirname(obj_filepath)) |dir| {
+        return std.fs.path.join(allocator, &.{ dir, sibling });
+    }
+    return allocator.dupe(u8, sibling);
+}
+
+fn materialForFace(face: Face, default_material: Material, materials: ?*const std.StringHashMap(Material)) Material {
+    const map = materials orelse return default_material;
+    const name = face.material_name orelse return default_material;
+    return map.get(name) orelse default_material;
+}
+
+fn buildMeshFromOBJData(
+    allocator: std.mem.Allocator,
+    obj_data: OBJData,
+    default_material: Material,
+    materials: ?*const std.StringHashMap(Material),
+) !Mesh {
+    std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
+        obj_data.vertices.len,
+        obj_data.normals.len,
+        obj_data.faces.len,
+    });
+
+    var has_normals_count: usize = 0;
+    for (obj_data.faces) |face| {
+        if (face.v0 >= obj_data.vertices.len or
+            face.v1 >= obj_data.vertices.len or
+            face.v2 >= obj_data.vertices.len)
+        {
+            return error.InvalidIndex;
+        }
+
+        if (face.hasNormals()) {
+            has_normals_count += 1;
+            if (face.n0 >= obj_data.normals.len or
+                face.n1 >= obj_data.normals.len or
+                face.n2 >= obj_data.normals.len)
+            {
+                return error.InvalidIndex;
+            }
+        }
+    }
+
+    const shading_type = if (has_normals_count == obj_data.faces.len)
+        "smooth"
+    else if (has_normals_count == 0)
+        "flat"
+    else
+        "mixed";
+
+    std.debug.print("Using {s} shading ({d}/{d} faces with normals)\n", .{
+        shading_type,
+        has_normals_count,
+        obj_data.faces.len,
+    });
+
+    var triangles = try allocator.alloc(Triangle, obj_data.faces.len);
+    errdefer allocator.free(triangles);
+
+    for (obj_data.faces, 0..) |face, i| {
+        const v0 = obj_data.vertices[face.v0];
+        const v1 = obj_data.vertices[face.v1];
+        const v2 = obj_data.vertices[face.v2];
+        const material = materialForFace(face, default_material, materials);
+
+        triangles[i] = if (face.hasNormals())
+            Triangle.initWithNormals(
+                v0,
+                v1,
+                v2,
+                obj_data.normals[face.n0],
+                obj_data.normals[face.n1],
+                obj_data.normals[face.n2],
+                material,
+            )
+        else
+            Triangle.init(v0, v1, v2, material);
+    }
+
+    return Mesh{
+        .triangles = triangles,
+        .allocator = allocator,
+    };
+}
+
 // ============================================================================
 // Mesh - Collection of Triangles
 // ============================================================================
@@ -1837,75 +2144,28 @@ const Mesh = struct {
         const obj_data = try parseOBJ(allocator, io, filepath);
         defer obj_data.deinit();
 
-        std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
-            obj_data.vertices.len,
-            obj_data.normals.len,
-            obj_data.faces.len,
-        });
+        return buildMeshFromOBJData(allocator, obj_data, material, null);
+    }
 
-        // Validate indices
-        var has_normals_count: usize = 0;
-        for (obj_data.faces) |face| {
-            // Check vertex indices
-            if (face.v0 >= obj_data.vertices.len or
-                face.v1 >= obj_data.vertices.len or
-                face.v2 >= obj_data.vertices.len)
-            {
-                return error.InvalidIndex;
-            }
+    pub fn fromOBJWithMaterials(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        filepath: []const u8,
+        default_material: Material,
+    ) !Mesh {
+        const obj_data = try parseOBJ(allocator, io, filepath);
+        defer obj_data.deinit();
 
-            // Check normal indices if present
-            if (face.hasNormals()) {
-                has_normals_count += 1;
-                if (face.n0 >= obj_data.normals.len or
-                    face.n1 >= obj_data.normals.len or
-                    face.n2 >= obj_data.normals.len)
-                {
-                    return error.InvalidIndex;
-                }
-            }
+        var materials = std.StringHashMap(Material).init(allocator);
+        defer materials.deinit();
+        var material_names = try std.ArrayList([]const u8).initCapacity(allocator, obj_data.mtllibs.len);
+        defer {
+            for (material_names.items) |name| allocator.free(name);
+            material_names.deinit(allocator);
         }
+        try loadOBJMaterials(allocator, io, filepath, obj_data.mtllibs, &materials, &material_names);
 
-        const shading_type = if (has_normals_count == obj_data.faces.len)
-            "smooth"
-        else if (has_normals_count == 0)
-            "flat"
-        else
-            "mixed";
-
-        std.debug.print("Using {s} shading ({d}/{d} faces with normals)\n", .{
-            shading_type,
-            has_normals_count,
-            obj_data.faces.len,
-        });
-
-        // Create triangles
-        var triangles = try allocator.alloc(Triangle, obj_data.faces.len);
-        errdefer allocator.free(triangles);
-
-        for (obj_data.faces, 0..) |face, i| {
-            const v0 = obj_data.vertices[face.v0];
-            const v1 = obj_data.vertices[face.v1];
-            const v2 = obj_data.vertices[face.v2];
-
-            triangles[i] = if (face.hasNormals())
-                Triangle.initWithNormals(
-                    v0,
-                    v1,
-                    v2,
-                    obj_data.normals[face.n0],
-                    obj_data.normals[face.n1],
-                    obj_data.normals[face.n2],
-                    material,
-                )
-            else
-                Triangle.init(v0, v1, v2, material);
-        }
-
-        return Mesh{
-            .triangles = triangles,
-            .allocator = allocator,
-        };
+        return buildMeshFromOBJData(allocator, obj_data, default_material, &materials);
     }
 
     pub fn deinit(self: Mesh) void {
@@ -4118,4 +4378,148 @@ test "selectNth keeps every primitive it was given" {
         seen[i] = true;
     }
     for (seen) |s| try std.testing.expect(s);
+}
+
+test "mtl parser collects supported material properties and skips textures" {
+    const data = try parseMTLText(std.testing.allocator,
+        \\# texture maps are for a renderer with UV sampling
+        \\newmtl paint
+        \\Kd 0.1 0.2 0.3
+        \\map_Kd paint.png
+        \\newmtl chrome
+        \\Ks 0.8 0.7 0.6
+        \\Ns 250
+        \\illum 3
+        \\newmtl water
+        \\Ni 1.33
+        \\Tr 0.75
+    );
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), data.materials.len);
+    try std.testing.expectEqualStrings("paint", data.materials[0].name);
+    try std.testing.expectEqual(Color{ 0.1, 0.2, 0.3 }, data.materials[0].kd);
+    try std.testing.expectEqualStrings("chrome", data.materials[1].name);
+    try std.testing.expectEqual(Color{ 0.8, 0.7, 0.6 }, data.materials[1].ks);
+    try std.testing.expectApproxEqAbs(250.0, data.materials[1].ns, 1e-9);
+    try std.testing.expectEqual(@as(u32, 3), data.materials[1].illum);
+    try std.testing.expectEqualStrings("water", data.materials[2].name);
+    try std.testing.expectApproxEqAbs(1.33, data.materials[2].ni, 1e-9);
+    try std.testing.expectApproxEqAbs(0.25, data.materials[2].opacity, 1e-9);
+}
+
+test "mtl entries map to diffuse specular and transparent renderer materials" {
+    const data = try parseMTLText(std.testing.allocator,
+        \\newmtl matte
+        \\Kd 0.2 0.4 0.6
+        \\newmtl mirror
+        \\Ks 0.9 0.8 0.7
+        \\Ns 500
+        \\illum 3
+        \\newmtl glass
+        \\Kd 0.1 0.9 0.4
+        \\Ni 1.33
+        \\d 0.4
+    );
+    defer data.deinit();
+
+    const diffuse = materialFromMTL(data.materials[0]);
+    try std.testing.expectEqual(MaterialType.lambertian, diffuse.material_type);
+    try std.testing.expectEqual(Color{ 0.2, 0.4, 0.6 }, diffuse.albedo);
+
+    const specular = materialFromMTL(data.materials[1]);
+    try std.testing.expectEqual(MaterialType.metal, specular.material_type);
+    try std.testing.expectEqual(Color{ 0.9, 0.8, 0.7 }, specular.albedo);
+    try std.testing.expect(specular.fuzz < 0.1);
+
+    const transparent = materialFromMTL(data.materials[2]);
+    try std.testing.expectEqual(MaterialType.dielectric, transparent.material_type);
+    try std.testing.expectApproxEqAbs(1.33, transparent.refraction_index, 1e-9);
+}
+
+test "obj usemtl records the active material for each face" {
+    const data = try parseOBJText(std.testing.allocator,
+        \\mtllib scene.mtl
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\v 0 0 1
+        \\f 1 2 3
+        \\usemtl red
+        \\f 1 2 4
+        \\usemtl blue
+        \\f 1 3 4
+        \\usemtl missing
+        \\f 2 3 4
+    );
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), data.mtllibs.len);
+    try std.testing.expectEqualStrings("scene.mtl", data.mtllibs[0]);
+    try std.testing.expectEqual(@as(usize, 4), data.faces.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), data.faces[0].material_name);
+    try std.testing.expectEqualStrings("red", data.faces[1].material_name.?);
+    try std.testing.expectEqualStrings("blue", data.faces[2].material_name.?);
+    try std.testing.expectEqualStrings("missing", data.faces[3].material_name.?);
+}
+
+test "mesh construction uses face materials and falls back to the default" {
+    const obj_data = try parseOBJText(std.testing.allocator,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\v 0 0 1
+        \\f 1 2 3
+        \\usemtl red
+        \\f 1 2 4
+        \\usemtl blue
+        \\f 1 3 4
+        \\usemtl missing
+        \\f 2 3 4
+    );
+    defer obj_data.deinit();
+
+    const mtl_data = try parseMTLText(std.testing.allocator,
+        \\newmtl red
+        \\Kd 0.8 0.1 0.1
+        \\newmtl blue
+        \\Ks 0.1 0.2 0.9
+        \\Ns 200
+        \\illum 3
+    );
+    defer mtl_data.deinit();
+
+    var materials = std.StringHashMap(Material).init(std.testing.allocator);
+    defer materials.deinit();
+    for (mtl_data.materials) |entry| {
+        try materials.put(entry.name, materialFromMTL(entry));
+    }
+
+    const default_material = Material.lambertian(Color{ 0.5, 0.5, 0.5 });
+    var mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, &materials);
+    defer mesh.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), mesh.triangles.len);
+    try std.testing.expectEqual(default_material.albedo, mesh.triangles[0].material.albedo);
+    try std.testing.expectEqual(MaterialType.lambertian, mesh.triangles[1].material.material_type);
+    try std.testing.expectEqual(Color{ 0.8, 0.1, 0.1 }, mesh.triangles[1].material.albedo);
+    try std.testing.expectEqual(MaterialType.metal, mesh.triangles[2].material.material_type);
+    try std.testing.expectEqual(Color{ 0.1, 0.2, 0.9 }, mesh.triangles[2].material.albedo);
+    try std.testing.expectEqual(default_material.albedo, mesh.triangles[3].material.albedo);
+
+    var single_material_mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, null);
+    defer single_material_mesh.deinit();
+    for (single_material_mesh.triangles) |triangle| {
+        try std.testing.expectEqual(default_material.albedo, triangle.material.albedo);
+    }
+}
+
+test "mtllib paths are resolved beside the obj file" {
+    const relative = try pathRelativeToObj(std.testing.allocator, "models/creature/model.obj", "materials/body.mtl");
+    defer std.testing.allocator.free(relative);
+    try std.testing.expectEqualStrings("models/creature/materials/body.mtl", relative);
+
+    const basename = try pathRelativeToObj(std.testing.allocator, "model.obj", "body.mtl");
+    defer std.testing.allocator.free(basename);
+    try std.testing.expectEqualStrings("body.mtl", basename);
 }
