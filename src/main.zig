@@ -2345,6 +2345,30 @@ const default_scene_name = "cover";
 
 /// Fetched by `make models`, not committed. See models/manifest.tsv.
 const dragon_model_path = "models/xyzrgb_dragon.obj";
+const bunny_model_path = "models/stanford-bunny.obj";
+const spot_model_path = "models/spot.obj";
+
+/// Load a model that `make models` fetches rather than one the repository
+/// carries. A missing file here is the expected first run, not a broken
+/// install, so it says what to do about it instead of reporting FileNotFound
+/// and leaving the reader to work out which file and why.
+fn loadFetchedMesh(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    material: Material,
+) !Mesh {
+    return Mesh.fromOBJ(allocator, io, path, material) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print(
+                "Error: {s} is not here. It is fetched rather than committed: run 'make models'.\n",
+                .{path},
+            );
+            return err;
+        },
+        else => return err,
+    };
+}
 
 const scenes = [_]Scene{
     .{
@@ -2361,6 +2385,16 @@ const scenes = [_]Scene{
         .name = "glass-dragon",
         .description = "XYZ RGB Asian Dragon in glass, 250k triangles (needs 'make models')",
         .build = buildGlassDragonScene,
+    },
+    .{
+        .name = "glass-bunny",
+        .description = "Stanford bunny in glass, 69k triangles: the quick caustic scene (needs 'make models')",
+        .build = buildGlassBunnyScene,
+    },
+    .{
+        .name = "spot",
+        .description = "Spot the cow under a daylit sky, with a glass sphere for company (needs 'make models')",
+        .build = buildSpotScene,
     },
 };
 
@@ -2561,17 +2595,36 @@ fn buildCornellBoxScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
     return scene;
 }
 
-/// The glass dragon: the XYZ RGB Asian Dragon rendered as a dielectric, which
-/// is the classic photon-mapping subject and the reason this scene exists.
+/// How a studio scene is set up around whichever model it is given.
+const StudioOptions = struct {
+    /// Degrees around Y before fitting, to turn the model towards the camera.
+    rotate_y: f64 = 0.0,
+    /// Longest side after fitting, in world units.
+    size: f64 = 6.0,
+    /// Half-width of the floor.
+    floor: f64 = 14.0,
+    floor_color: Color = Color{ 0.58, 0.56, 0.52 },
+    /// Radiance of the panel overhead.
+    emission: Color = Color{ 26.0, 25.0, 24.0 },
+    photons: PhotonBudget = .{},
+};
+
+/// One model on a floor under a panel, against a near-black sky.
 ///
-/// Lit by a panel against a near-black sky rather than by daylight. An open,
-/// sky-lit field washes a caustic out — that is the complaint that started
-/// this scene — so the dragon gets a dark room and one lamp instead.
-///
-/// The model is fetched rather than committed, so it may not be there.
-fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+/// Lit this way rather than by daylight because an open, sky-lit field washes
+/// a caustic out, which is the whole reason these scenes exist. The camera and
+/// the lamp are placed from the model's own fitted bounds, so pointing this at
+/// a different model needs no new constants: that is what makes it worth
+/// sharing between the dragon and the bunny.
+fn buildStudioScene(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+    material: Material,
+    options: StudioOptions,
+) !SceneData {
     var scene = SceneData.init(allocator, CameraSpec{
-        // Replaced below, once the dragon's fitted size is known.
+        // Replaced below, once the model's fitted size is known.
         .lookfrom = Point3{ 0, 3, 11 },
         .lookat = Point3{ 0, 1, 0 },
         .vfov = 32.0,
@@ -2579,55 +2632,38 @@ fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
     errdefer scene.deinit();
 
     scene.background = .{ .solid = Color{ 0.02, 0.025, 0.035 } };
-    // Glass over a large floor sends a lot of photons a long way, and a closed
-    // budget would stop the emission early and dim the caustic.
-    scene.photons = .{ .emitted = 2_000_000, .capacity = 700_000 };
+    scene.photons = options.photons;
 
     // A flat floor rather than a sphere of radius 1000: the photon grid is
     // sized from the scene, and a floor that is honestly flat keeps that box
     // tight around the part of the world the caustic lands on.
-    const floor = 14.0;
     try scene.addQuad(
-        Point3{ -floor, 0, -floor },
-        Vec3{ 2 * floor, 0, 0 },
-        Vec3{ 0, 0, 2 * floor },
-        Material.lambertian(Color{ 0.58, 0.56, 0.52 }),
+        Point3{ -options.floor, 0, -options.floor },
+        Vec3{ 2 * options.floor, 0, 0 },
+        Vec3{ 0, 0, 2 * options.floor },
+        Material.lambertian(options.floor_color),
     );
 
-    var dragon_box: AABB = undefined;
+    var model_box: AABB = undefined;
     {
-        var dragon = Mesh.fromOBJ(
-            allocator,
-            io,
-            dragon_model_path,
-            Material.dielectric(1.5),
-        ) catch |err| switch (err) {
-            error.FileNotFound => {
-                std.debug.print(
-                    "Error: {s} is not here. It is fetched rather than committed: run 'make models'.\n",
-                    .{dragon_model_path},
-                );
-                return err;
-            },
-            else => return err,
-        };
-        defer dragon.deinit();
+        var model = try loadFetchedMesh(allocator, io, model_path, material);
+        defer model.deinit();
 
-        try dragon.generateSmoothNormals(allocator);
-        dragon.rotateY(140.0);
-        dragon.fitTo(Point3{ 0, 0, 0 }, 6.0);
-        dragon.placeOnGround(0.0);
+        try model.generateSmoothNormals(allocator);
+        model.rotateY(options.rotate_y);
+        model.fitTo(Point3{ 0, 0, 0 }, options.size);
+        model.placeOnGround(0.0);
 
-        dragon_box = dragon.bounds();
-        try scene.addMesh(dragon);
+        model_box = model.bounds();
+        try scene.addMesh(model);
     }
 
     const center = Point3{
-        (dragon_box.x.min + dragon_box.x.max) / 2.0,
-        (dragon_box.y.min + dragon_box.y.max) / 2.0,
-        (dragon_box.z.min + dragon_box.z.max) / 2.0,
+        (model_box.x.min + model_box.x.max) / 2.0,
+        (model_box.y.min + model_box.y.max) / 2.0,
+        (model_box.z.min + model_box.z.max) / 2.0,
     };
-    const reach = @max(@max(dragon_box.x.size(), dragon_box.y.size()), dragon_box.z.size());
+    const reach = @max(@max(model_box.x.size(), model_box.y.size()), model_box.z.size());
 
     // Frame whatever the model turned out to be rather than a hand-tuned guess.
     const distance = reach * 1.9;
@@ -2639,19 +2675,125 @@ fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
         .focus_dist = distance,
     };
 
-    // A panel over the dragon, high enough to light the floor around it.
+    // A panel over the model, high enough to light the floor around it.
     const panel_side = reach * 0.55;
     const panel_corner = Point3{
         center[0] - panel_side / 2.0,
-        dragon_box.y.max + reach * 0.9,
+        model_box.y.max + reach * 0.9,
         center[2] - panel_side / 2.0,
     };
     const panel_u = Vec3{ panel_side, 0, 0 };
     const panel_v = Vec3{ 0, 0, panel_side };
-    const emission = Color{ 26.0, 25.0, 24.0 };
 
-    try scene.addQuad(panel_corner, panel_u, panel_v, Material.diffuseLight(Color{ 1.0, 0.96, 0.92 }, 26.0));
-    try scene.addLight(Light.quadLight(panel_corner, panel_u, panel_v, emission));
+    const brightest = @max(@max(options.emission[0], options.emission[1]), options.emission[2]);
+    try scene.addQuad(panel_corner, panel_u, panel_v, Material.diffuseLight(div(options.emission, brightest), brightest));
+    try scene.addLight(Light.quadLight(panel_corner, panel_u, panel_v, options.emission));
+
+    return scene;
+}
+
+/// The glass dragon: the XYZ RGB Asian Dragon rendered as a dielectric, which
+/// is the classic photon-mapping subject and the reason these scenes exist.
+///
+/// The model is fetched rather than committed, so it may not be there.
+fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    return buildStudioScene(allocator, io, dragon_model_path, Material.dielectric(1.5), .{
+        .rotate_y = 140.0,
+        .size = 6.0,
+        // Glass over a large floor sends a lot of photons a long way, and a
+        // closed budget would stop the emission early and dim the caustic.
+        .photons = .{ .emitted = 2_000_000, .capacity = 700_000 },
+    });
+}
+
+/// The Stanford bunny in glass. The same studio as the dragon, at 69,451
+/// triangles instead of 249,882, which makes it the one to iterate on when
+/// changing anything about caustics: it builds its BVH in a fraction of the
+/// time and still throws a proper caustic.
+fn buildGlassBunnyScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    return buildStudioScene(allocator, io, bunny_model_path, Material.dielectric(1.5), .{
+        // The bunny faces the camera-left as it comes; turn it to a three-quarter view.
+        .rotate_y = 270.0,
+        .size = 4.5,
+        // A third of the emitted photons come back as caustic photons here,
+        // against a tenth for the dragon: less glass to get lost inside.
+        .photons = .{ .emitted = 2_000_000, .capacity = 700_000 },
+    });
+}
+
+/// Spot, Keenan Crane's cow, lit by daylight rather than staged in the dark.
+///
+/// Deliberately the plain one: a lambertian mesh under the sky, with no
+/// dielectric anywhere. It is also the only model here whose faces carry
+/// texture indices (`f v/vt`), so it exercises a corner of the OBJ parser the
+/// other models never reach.
+fn buildSpotScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ 0, 3, 11 },
+        .lookat = Point3{ 0, 1, 0 },
+        .vfov = 32.0,
+    });
+    errdefer scene.deinit();
+
+    // One small glass sphere converts about a third of the emitted photons
+    // into stored caustic photons, which the default capacity cannot hold.
+    scene.photons = .{ .emitted = 1_000_000, .capacity = 400_000 };
+
+    const floor = 30.0;
+    try scene.addQuad(
+        Point3{ -floor, 0, -floor },
+        Vec3{ 2 * floor, 0, 0 },
+        Vec3{ 0, 0, 2 * floor },
+        Material.lambertian(Color{ 0.48, 0.52, 0.42 }),
+    );
+
+    var spot_box: AABB = undefined;
+    {
+        var spot = try loadFetchedMesh(
+            allocator,
+            io,
+            spot_model_path,
+            Material.lambertian(Color{ 0.76, 0.34, 0.30 }),
+        );
+        defer spot.deinit();
+
+        try spot.generateSmoothNormals(allocator);
+        spot.rotateY(215.0);
+        spot.fitTo(Point3{ 0, 0, 0 }, 4.0);
+        spot.placeOnGround(0.0);
+
+        spot_box = spot.bounds();
+        try scene.addMesh(spot);
+    }
+
+    const center = Point3{
+        (spot_box.x.min + spot_box.x.max) / 2.0,
+        (spot_box.y.min + spot_box.y.max) / 2.0,
+        (spot_box.z.min + spot_box.z.max) / 2.0,
+    };
+    const reach = @max(@max(spot_box.x.size(), spot_box.y.size()), spot_box.z.size());
+    const distance = reach * 2.1;
+
+    scene.camera = CameraSpec{
+        .lookfrom = Point3{ center[0] + 0.5 * reach, center[1] + 0.45 * reach, center[2] + distance },
+        .lookat = center,
+        .vfov = 34.0,
+        .focus_dist = distance,
+    };
+
+    // A glass sphere beside her, so the scene still has a caustic to show and
+    // the photon grid still has something to anchor on.
+    try scene.addSphere(Sphere.init(
+        Point3{ center[0] - reach * 0.42, reach * 0.26, center[2] + reach * 0.55 },
+        reach * 0.26,
+        Material.dielectric(1.5),
+    ));
+
+    try scene.addLight(Light.pointLight(
+        Point3{ 5, 9, 4 },
+        Color{ 1.0, 1.0, 1.0 },
+        900.0,
+    ));
 
     return scene;
 }
@@ -3329,6 +3471,52 @@ test "the scene registry answers only for names it knows" {
         const found = findScene(scene.name);
         try std.testing.expect(found != null);
         try std.testing.expectEqualStrings(scene.name, found.?.name);
+    }
+
+    // Names have to be unique, or findScene quietly returns the first of them
+    // and one scene becomes unreachable from the command line.
+    for (&scenes, 0..) |scene, i| {
+        for (scenes[i + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, scene.name, other.name));
+        }
+    }
+}
+
+test "every fetched model a scene asks for is in the manifest" {
+    // Embedded rather than read at run time: this is a question about the
+    // repository, not about what happens to be on this machine, and a scene
+    // pointing at a model no one can fetch should fail the build.
+    const manifest = @embedFile("models_manifest");
+
+    const fetched = [_][]const u8{ dragon_model_path, bunny_model_path, spot_model_path };
+
+    for (fetched) |path| {
+        // The manifest names files; the scenes name paths under models/.
+        const prefix = "models/";
+        try std.testing.expect(std.mem.startsWith(u8, path, prefix));
+        const filename = path[prefix.len..];
+
+        var listed = false;
+        var lines = std.mem.splitScalar(u8, manifest, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 or line[0] == '#') continue;
+            var fields = std.mem.splitScalar(u8, line, '\t');
+            const name = fields.next() orelse continue;
+            if (std.mem.eql(u8, std.mem.trim(u8, name, " \r"), filename)) {
+                // A url and a checksum, or `make models` cannot act on it.
+                const url = fields.next() orelse return error.ManifestEntryMissingUrl;
+                const sum = fields.next() orelse return error.ManifestEntryMissingChecksum;
+                try std.testing.expect(url.len > 0);
+                try std.testing.expectEqual(@as(usize, 64), std.mem.trim(u8, sum, " \r").len);
+                listed = true;
+                break;
+            }
+        }
+
+        if (!listed) {
+            std.debug.print("model '{s}' is used by a scene but not listed in models/manifest.tsv\n", .{filename});
+            return error.ModelNotInManifest;
+        }
     }
 }
 

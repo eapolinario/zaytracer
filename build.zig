@@ -54,6 +54,15 @@ pub fn build(b: *std.Build) void {
 
     test_module.addImport("build_options", options.createModule());
 
+    // @embedFile cannot reach outside the module's own directory, and the
+    // manifest lives in models/. Tests check that every model a scene asks for
+    // is listed there, which is a question about the repository rather than
+    // about what happens to be on this machine, so it is answered at compile
+    // time. Only the test module needs it.
+    test_module.addAnonymousImport("models_manifest", .{
+        .root_source_file = b.path("models/manifest.tsv"),
+    });
+
     const exe_unit_tests = b.addTest(.{
         .name = "zaytracer-test",
         .root_module = test_module,
