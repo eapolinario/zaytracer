@@ -2058,8 +2058,10 @@ fn buildMeshFromOBJData(
     obj_data: OBJData,
     default_material: Material,
     materials: ?*const std.StringHashMap(Material),
+    format_name: []const u8,
 ) !Mesh {
-    std.debug.print("Loaded OBJ: {d} vertices, {d} normals, {d} faces\n", .{
+    std.debug.print("Loaded {s}: {d} vertices, {d} normals, {d} faces\n", .{
+        format_name,
         obj_data.vertices.len,
         obj_data.normals.len,
         obj_data.faces.len,
@@ -2127,6 +2129,350 @@ fn buildMeshFromOBJData(
     };
 }
 
+const PLYFormat = enum { ascii, binary_little_endian };
+const PLYScalarType = enum {
+    char,
+    uchar,
+    short,
+    ushort,
+    int,
+    uint,
+    float,
+    double,
+
+    fn width(self: PLYScalarType) usize {
+        return switch (self) {
+            .char, .uchar => 1,
+            .short, .ushort => 2,
+            .int, .uint, .float => 4,
+            .double => 8,
+        };
+    }
+
+    fn isFloat(self: PLYScalarType) bool {
+        return self == .float or self == .double;
+    }
+};
+const PLYProperty = union(enum) {
+    scalar: struct { ty: PLYScalarType, name: []const u8 },
+    list: struct { count_ty: PLYScalarType, item_ty: PLYScalarType, name: []const u8 },
+};
+const PLYElement = struct { name: []const u8, count: usize, props: []PLYProperty };
+const PLYHeader = struct {
+    format: PLYFormat,
+    elements: []PLYElement,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: PLYHeader) void {
+        for (self.elements) |element| self.allocator.free(element.props);
+        self.allocator.free(self.elements);
+    }
+};
+const PLYHeaderResult = struct { header: PLYHeader, body_offset: usize };
+
+fn parsePLY(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !OBJData {
+    const max_file_size = 50 * 1024 * 1024;
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
+    defer allocator.free(contents);
+    return parsePLYText(allocator, contents);
+}
+
+/// The parser proper, split from file I/O so ASCII and binary PLY fixtures can
+/// live in tests as in-memory bytes rather than checked-in model files.
+fn parsePLYText(allocator: std.mem.Allocator, contents: []const u8) !OBJData {
+    const parsed = try parsePLYHeader(allocator, contents);
+    defer parsed.header.deinit();
+    return switch (parsed.header.format) {
+        .ascii => parsePLYAsciiBody(allocator, contents[parsed.body_offset..], parsed.header),
+        .binary_little_endian => parsePLYBinaryBody(allocator, contents[parsed.body_offset..], parsed.header),
+    };
+}
+
+fn parsePLYHeader(allocator: std.mem.Allocator, contents: []const u8) !PLYHeaderResult {
+    var elements = std.ArrayList(PLYElement).empty;
+    errdefer {
+        for (elements.items) |element| allocator.free(element.props);
+        elements.deinit(allocator);
+    }
+    var current_name: ?[]const u8 = null;
+    var current_count: usize = 0;
+    var current_props = std.ArrayList(PLYProperty).empty;
+    errdefer current_props.deinit(allocator);
+    var format: ?PLYFormat = null;
+    var offset: usize = 0;
+    var line_no: usize = 0;
+
+    while (offset < contents.len) {
+        const start = offset;
+        const rel = std.mem.indexOfScalar(u8, contents[offset..], '\n');
+        const end = if (rel) |n| offset + n else contents.len;
+        offset = if (rel) |_| end + 1 else contents.len;
+        var line = contents[start..end];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        const trimmed = std.mem.trim(u8, line, " \t");
+        line_no += 1;
+        if (line_no == 1) {
+            if (!std.mem.eql(u8, trimmed, "ply")) return error.InvalidFormat;
+            continue;
+        }
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, "end_header")) {
+            try finishPLYElement(allocator, &elements, &current_name, &current_count, &current_props);
+            return PLYHeaderResult{ .header = .{ .format = format orelse return error.MissingData, .elements = try elements.toOwnedSlice(allocator), .allocator = allocator }, .body_offset = offset };
+        }
+        if (std.mem.eql(u8, trimmed, "comment") or std.mem.startsWith(u8, trimmed, "comment ")) continue;
+
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const keyword = it.next() orelse continue;
+        if (std.mem.eql(u8, keyword, "format")) {
+            const name = it.next() orelse return error.InvalidFormat;
+            const version = it.next() orelse return error.InvalidFormat;
+            if (!std.mem.eql(u8, version, "1.0") or it.next() != null) return error.InvalidFormat;
+            if (std.mem.eql(u8, name, "ascii")) format = .ascii else if (std.mem.eql(u8, name, "binary_little_endian")) format = .binary_little_endian else if (std.mem.eql(u8, name, "binary_big_endian")) return error.UnsupportedFormat else return error.InvalidFormat;
+        } else if (std.mem.eql(u8, keyword, "element")) {
+            const name = it.next() orelse return error.InvalidFormat;
+            const count_text = it.next() orelse return error.InvalidFormat;
+            if (it.next() != null) return error.InvalidFormat;
+            try finishPLYElement(allocator, &elements, &current_name, &current_count, &current_props);
+            current_name = name;
+            current_count = try std.fmt.parseInt(usize, count_text, 10);
+        } else if (std.mem.eql(u8, keyword, "property")) {
+            if (current_name == null) return error.InvalidFormat;
+            const first = it.next() orelse return error.InvalidFormat;
+            if (std.mem.eql(u8, first, "list")) {
+                const count_ty = it.next() orelse return error.InvalidFormat;
+                const item_ty = it.next() orelse return error.InvalidFormat;
+                const name = it.next() orelse return error.InvalidFormat;
+                if (it.next() != null) return error.InvalidFormat;
+                try current_props.append(allocator, .{ .list = .{ .count_ty = try parsePLYScalarType(count_ty), .item_ty = try parsePLYScalarType(item_ty), .name = name } });
+            } else {
+                const name = it.next() orelse return error.InvalidFormat;
+                if (it.next() != null) return error.InvalidFormat;
+                try current_props.append(allocator, .{ .scalar = .{ .ty = try parsePLYScalarType(first), .name = name } });
+            }
+        } else return error.InvalidFormat;
+    }
+    return error.MissingData;
+}
+
+fn finishPLYElement(allocator: std.mem.Allocator, elements: *std.ArrayList(PLYElement), current_name: *?[]const u8, current_count: *usize, current_props: *std.ArrayList(PLYProperty)) !void {
+    const name = current_name.* orelse return;
+    try elements.append(allocator, .{ .name = name, .count = current_count.*, .props = try current_props.toOwnedSlice(allocator) });
+    current_name.* = null;
+    current_count.* = 0;
+    current_props.* = std.ArrayList(PLYProperty).empty;
+}
+
+fn parsePLYScalarType(name: []const u8) !PLYScalarType {
+    if (std.mem.eql(u8, name, "char") or std.mem.eql(u8, name, "int8")) return .char;
+    if (std.mem.eql(u8, name, "uchar") or std.mem.eql(u8, name, "uint8")) return .uchar;
+    if (std.mem.eql(u8, name, "short") or std.mem.eql(u8, name, "int16")) return .short;
+    if (std.mem.eql(u8, name, "ushort") or std.mem.eql(u8, name, "uint16")) return .ushort;
+    if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "int32")) return .int;
+    if (std.mem.eql(u8, name, "uint") or std.mem.eql(u8, name, "uint32")) return .uint;
+    if (std.mem.eql(u8, name, "float") or std.mem.eql(u8, name, "float32")) return .float;
+    if (std.mem.eql(u8, name, "double") or std.mem.eql(u8, name, "float64")) return .double;
+    return error.InvalidFormat;
+}
+
+fn parsePLYAsciiBody(allocator: std.mem.Allocator, body: []const u8, header: PLYHeader) !OBJData {
+    var vertices = std.ArrayList(Vec3).empty;
+    defer vertices.deinit(allocator);
+    var normals = std.ArrayList(Vec3).empty;
+    defer normals.deinit(allocator);
+    var faces = std.ArrayList(Face).empty;
+    defer faces.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    for (header.elements) |element| for (0..element.count) |_| {
+        const raw = lines.next() orelse return error.MissingData;
+        var tokens = std.mem.tokenizeAny(u8, std.mem.trim(u8, raw, " \t\r"), " \t");
+        if (std.mem.eql(u8, element.name, "vertex")) try parsePLYAsciiVertex(allocator, &vertices, &normals, element.props, &tokens) else if (std.mem.eql(u8, element.name, "face")) try parsePLYAsciiFace(allocator, &faces, element.props, &tokens, normals.items.len != 0) else try skipPLYAsciiElement(element.props, &tokens);
+    };
+    return .{ .vertices = try vertices.toOwnedSlice(allocator), .normals = try normals.toOwnedSlice(allocator), .faces = try faces.toOwnedSlice(allocator), .mtllibs = &.{}, .allocator = allocator };
+}
+
+fn parsePLYAsciiVertex(allocator: std.mem.Allocator, vertices: *std.ArrayList(Vec3), normals: *std.ArrayList(Vec3), props: []const PLYProperty, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+    var x: ?f64 = null;
+    var y: ?f64 = null;
+    var z: ?f64 = null;
+    var nx: ?f64 = null;
+    var ny: ?f64 = null;
+    var nz: ?f64 = null;
+    for (props) |prop| switch (prop) {
+        .scalar => |scalar| {
+            const v = try std.fmt.parseFloat(f64, tokens.next() orelse return error.MissingData);
+            assignPLYVertexField(scalar.name, v, &x, &y, &z, &nx, &ny, &nz);
+        },
+        .list => |list| try skipPLYAsciiList(list, tokens),
+    };
+    try vertices.append(allocator, Vec3{ x orelse return error.MissingData, y orelse return error.MissingData, z orelse return error.MissingData });
+    if (nx != null and ny != null and nz != null) try normals.append(allocator, Vec3{ nx.?, ny.?, nz.? });
+}
+
+fn parsePLYAsciiFace(allocator: std.mem.Allocator, faces: *std.ArrayList(Face), props: []const PLYProperty, tokens: *std.mem.TokenIterator(u8, .any), has_normals: bool) !void {
+    var saw = false;
+    for (props) |prop| switch (prop) {
+        .scalar => {
+            _ = tokens.next() orelse return error.MissingData;
+        },
+        .list => |list| if (std.mem.eql(u8, list.name, "vertex_indices")) {
+            if (saw) return error.InvalidFormat;
+            saw = true;
+            const count = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingData, 10);
+            if (count < 3) return error.InvalidFormat;
+            var indices = try std.ArrayList(u32).initCapacity(allocator, count);
+            defer indices.deinit(allocator);
+            for (0..count) |_| {
+                const idx = try std.fmt.parseInt(i64, tokens.next() orelse return error.MissingData, 10);
+                if (idx < 0 or idx > std.math.maxInt(u32)) return error.InvalidIndex;
+                try indices.append(allocator, @intCast(idx));
+            }
+            try appendPLYFaceFan(allocator, faces, indices.items, has_normals);
+        } else try skipPLYAsciiList(list, tokens),
+    };
+    if (!saw) return error.MissingData;
+}
+
+fn skipPLYAsciiElement(props: []const PLYProperty, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+    for (props) |prop| switch (prop) {
+        .scalar => {
+            _ = tokens.next() orelse return error.MissingData;
+        },
+        .list => |list| try skipPLYAsciiList(list, tokens),
+    };
+}
+fn skipPLYAsciiList(list: anytype, tokens: *std.mem.TokenIterator(u8, .any)) !void {
+    _ = list;
+    const count = try std.fmt.parseInt(usize, tokens.next() orelse return error.MissingData, 10);
+    for (0..count) |_| _ = tokens.next() orelse return error.MissingData;
+}
+
+const PLYBinaryCursor = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    fn readF64(self: *PLYBinaryCursor, ty: PLYScalarType) !f64 {
+        return switch (ty) {
+            .char => @floatFromInt(try self.readSigned(1)),
+            .uchar => @floatFromInt(try self.readUnsigned(1)),
+            .short => @floatFromInt(try self.readSigned(2)),
+            .ushort => @floatFromInt(try self.readUnsigned(2)),
+            .int => @floatFromInt(try self.readSigned(4)),
+            .uint => @floatFromInt(try self.readUnsigned(4)),
+            .float => @as(f64, @floatCast(@as(f32, @bitCast(@as(u32, @intCast(try self.readUnsigned(4))))))),
+            .double => @bitCast(try self.readUnsigned(8)),
+        };
+    }
+    fn readUsize(self: *PLYBinaryCursor, ty: PLYScalarType) !usize {
+        if (ty.isFloat()) return error.InvalidFormat;
+        const value = switch (ty) {
+            .char, .short, .int => blk: {
+                const signed = try self.readSigned(ty.width());
+                if (signed < 0) return error.InvalidIndex;
+                break :blk @as(u64, @intCast(signed));
+            },
+            .uchar, .ushort, .uint => try self.readUnsigned(ty.width()),
+            .float, .double => unreachable,
+        };
+        if (value > std.math.maxInt(usize)) return error.InvalidIndex;
+        return @intCast(value);
+    }
+    fn readU32(self: *PLYBinaryCursor, ty: PLYScalarType) !u32 {
+        const value = try self.readUsize(ty);
+        if (value > std.math.maxInt(u32)) return error.InvalidIndex;
+        return @intCast(value);
+    }
+    fn skipScalar(self: *PLYBinaryCursor, ty: PLYScalarType) !void {
+        try self.skipBytes(ty.width());
+    }
+    fn skipBytes(self: *PLYBinaryCursor, count: usize) !void {
+        if (count > self.bytes.len - self.offset) return error.MissingData;
+        self.offset += count;
+    }
+    fn readUnsigned(self: *PLYBinaryCursor, width: usize) !u64 {
+        if (width > self.bytes.len - self.offset) return error.MissingData;
+        const start = self.offset;
+        self.offset += width;
+        var result: u64 = 0;
+        for (self.bytes[start..self.offset], 0..) |byte, i| result |= @as(u64, byte) << @intCast(i * 8);
+        return result;
+    }
+    fn readSigned(self: *PLYBinaryCursor, width: usize) !i64 {
+        const unsigned = try self.readUnsigned(width);
+        const shift: u6 = @intCast(64 - width * 8);
+        return @as(i64, @bitCast(unsigned << shift)) >> shift;
+    }
+};
+
+fn parsePLYBinaryBody(allocator: std.mem.Allocator, body: []const u8, header: PLYHeader) !OBJData {
+    var vertices = std.ArrayList(Vec3).empty;
+    defer vertices.deinit(allocator);
+    var normals = std.ArrayList(Vec3).empty;
+    defer normals.deinit(allocator);
+    var faces = std.ArrayList(Face).empty;
+    defer faces.deinit(allocator);
+    var cursor = PLYBinaryCursor{ .bytes = body };
+    for (header.elements) |element| for (0..element.count) |_| {
+        if (std.mem.eql(u8, element.name, "vertex")) try parsePLYBinaryVertex(allocator, &vertices, &normals, element.props, &cursor) else if (std.mem.eql(u8, element.name, "face")) try parsePLYBinaryFace(allocator, &faces, element.props, &cursor, normals.items.len != 0) else try skipPLYBinaryElement(element.props, &cursor);
+    };
+    return .{ .vertices = try vertices.toOwnedSlice(allocator), .normals = try normals.toOwnedSlice(allocator), .faces = try faces.toOwnedSlice(allocator), .mtllibs = &.{}, .allocator = allocator };
+}
+
+fn parsePLYBinaryVertex(allocator: std.mem.Allocator, vertices: *std.ArrayList(Vec3), normals: *std.ArrayList(Vec3), props: []const PLYProperty, cursor: *PLYBinaryCursor) !void {
+    var x: ?f64 = null;
+    var y: ?f64 = null;
+    var z: ?f64 = null;
+    var nx: ?f64 = null;
+    var ny: ?f64 = null;
+    var nz: ?f64 = null;
+    for (props) |prop| switch (prop) {
+        .scalar => |scalar| assignPLYVertexField(scalar.name, try cursor.readF64(scalar.ty), &x, &y, &z, &nx, &ny, &nz),
+        .list => |list| try skipPLYBinaryList(list, cursor),
+    };
+    try vertices.append(allocator, Vec3{ x orelse return error.MissingData, y orelse return error.MissingData, z orelse return error.MissingData });
+    if (nx != null and ny != null and nz != null) try normals.append(allocator, Vec3{ nx.?, ny.?, nz.? });
+}
+
+fn parsePLYBinaryFace(allocator: std.mem.Allocator, faces: *std.ArrayList(Face), props: []const PLYProperty, cursor: *PLYBinaryCursor, has_normals: bool) !void {
+    var saw = false;
+    for (props) |prop| switch (prop) {
+        .scalar => |scalar| try cursor.skipScalar(scalar.ty),
+        .list => |list| if (std.mem.eql(u8, list.name, "vertex_indices")) {
+            if (saw) return error.InvalidFormat;
+            saw = true;
+            const count = try cursor.readUsize(list.count_ty);
+            if (count < 3) return error.InvalidFormat;
+            var indices = try std.ArrayList(u32).initCapacity(allocator, count);
+            defer indices.deinit(allocator);
+            for (0..count) |_| try indices.append(allocator, try cursor.readU32(list.item_ty));
+            try appendPLYFaceFan(allocator, faces, indices.items, has_normals);
+        } else try skipPLYBinaryList(list, cursor),
+    };
+    if (!saw) return error.MissingData;
+}
+
+fn skipPLYBinaryElement(props: []const PLYProperty, cursor: *PLYBinaryCursor) !void {
+    for (props) |prop| switch (prop) {
+        .scalar => |scalar| try cursor.skipScalar(scalar.ty),
+        .list => |list| try skipPLYBinaryList(list, cursor),
+    };
+}
+fn skipPLYBinaryList(list: anytype, cursor: *PLYBinaryCursor) !void {
+    const count = try cursor.readUsize(list.count_ty);
+    for (0..count) |_| try cursor.skipScalar(list.item_ty);
+}
+fn assignPLYVertexField(name: []const u8, value: f64, x: *?f64, y: *?f64, z: *?f64, nx: *?f64, ny: *?f64, nz: *?f64) void {
+    if (std.mem.eql(u8, name, "x")) x.* = value;
+    if (std.mem.eql(u8, name, "y")) y.* = value;
+    if (std.mem.eql(u8, name, "z")) z.* = value;
+    if (std.mem.eql(u8, name, "nx")) nx.* = value;
+    if (std.mem.eql(u8, name, "ny")) ny.* = value;
+    if (std.mem.eql(u8, name, "nz")) nz.* = value;
+}
+fn appendPLYFaceFan(allocator: std.mem.Allocator, faces: *std.ArrayList(Face), indices: []const u32, has_normals: bool) !void {
+    const sentinel: u32 = 0xFFFFFFFF;
+    for (1..indices.len - 1) |i| try faces.append(allocator, .{ .v0 = indices[0], .v1 = indices[i], .v2 = indices[i + 1], .n0 = if (has_normals) indices[0] else sentinel, .n1 = if (has_normals) indices[i] else sentinel, .n2 = if (has_normals) indices[i + 1] else sentinel, .material_name = null });
+}
+
 // ============================================================================
 // Mesh - Collection of Triangles
 // ============================================================================
@@ -2144,7 +2490,21 @@ const Mesh = struct {
         const obj_data = try parseOBJ(allocator, io, filepath);
         defer obj_data.deinit();
 
-        return buildMeshFromOBJData(allocator, obj_data, material, null);
+        return buildMeshFromOBJData(allocator, obj_data, material, null, "OBJ");
+    }
+
+    /// PLY carries the same vertices, normals and faces once parsed, so it
+    /// shares everything downstream of the parser with OBJ.
+    pub fn fromPLY(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        filepath: []const u8,
+        material: Material,
+    ) !Mesh {
+        const ply_data = try parsePLY(allocator, io, filepath);
+        defer ply_data.deinit();
+
+        return buildMeshFromOBJData(allocator, ply_data, material, null, "PLY");
     }
 
     pub fn fromOBJWithMaterials(
@@ -2165,7 +2525,7 @@ const Mesh = struct {
         }
         try loadOBJMaterials(allocator, io, filepath, obj_data.mtllibs, &materials, &material_names);
 
-        return buildMeshFromOBJData(allocator, obj_data, default_material, &materials);
+        return buildMeshFromOBJData(allocator, obj_data, default_material, &materials, "OBJ");
     }
 
     pub fn deinit(self: Mesh) void {
@@ -4496,7 +4856,7 @@ test "mesh construction uses face materials and falls back to the default" {
     }
 
     const default_material = Material.lambertian(Color{ 0.5, 0.5, 0.5 });
-    var mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, &materials);
+    var mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, &materials, "OBJ");
     defer mesh.deinit();
 
     try std.testing.expectEqual(@as(usize, 4), mesh.triangles.len);
@@ -4507,7 +4867,7 @@ test "mesh construction uses face materials and falls back to the default" {
     try std.testing.expectEqual(Color{ 0.1, 0.2, 0.9 }, mesh.triangles[2].material.albedo);
     try std.testing.expectEqual(default_material.albedo, mesh.triangles[3].material.albedo);
 
-    var single_material_mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, null);
+    var single_material_mesh = try buildMeshFromOBJData(std.testing.allocator, obj_data, default_material, null, "OBJ");
     defer single_material_mesh.deinit();
     for (single_material_mesh.triangles) |triangle| {
         try std.testing.expectEqual(default_material.albedo, triangle.material.albedo);
@@ -4522,4 +4882,214 @@ test "mtllib paths are resolved beside the obj file" {
     const basename = try pathRelativeToObj(std.testing.allocator, "model.obj", "body.mtl");
     defer std.testing.allocator.free(basename);
     try std.testing.expectEqualStrings("body.mtl", basename);
+}
+
+// ============================================================================
+// Tests - PLY Parsing
+// ============================================================================
+
+fn expectSameMeshData(a: OBJData, b: OBJData) !void {
+    try std.testing.expectEqual(a.vertices.len, b.vertices.len);
+    try std.testing.expectEqual(a.normals.len, b.normals.len);
+    try std.testing.expectEqual(a.faces.len, b.faces.len);
+    for (a.vertices, b.vertices) |av, bv| try std.testing.expectEqual(av, bv);
+    for (a.normals, b.normals) |an, bn| try std.testing.expectEqual(an, bn);
+    for (a.faces, b.faces) |af, bf| try std.testing.expectEqual(af, bf);
+}
+
+test "ply ascii triangles parse and ignore extra vertex properties" {
+    const source =
+        \\ply
+        \\format ascii 1.0
+        \\comment confidence is present in Stanford scans but is not geometry
+        \\element vertex 4
+        \\property float x
+        \\property float y
+        \\property float z
+        \\property uchar confidence
+        \\property float intensity
+        \\element face 2
+        \\property list uchar int vertex_indices
+        \\end_header
+        \\0 0 0 255 0.25
+        \\1 0 0 254 0.50
+        \\1 1 0 253 0.75
+        \\0 1 0 252 1.00
+        \\3 0 1 2
+        \\3 0 2 3
+    ;
+    const data = try parsePLYText(std.testing.allocator, source);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 4), data.vertices.len);
+    try std.testing.expectEqual(Vec3{ 1, 1, 0 }, data.vertices[2]);
+    try std.testing.expectEqual(@as(usize, 0), data.normals.len);
+    try std.testing.expectEqual(@as(usize, 2), data.faces.len);
+    try std.testing.expectEqual(Face{ .v0 = 0, .v1 = 1, .v2 = 2, .n0 = 0xFFFFFFFF, .n1 = 0xFFFFFFFF, .n2 = 0xFFFFFFFF, .material_name = null }, data.faces[0]);
+    try std.testing.expectEqual(Face{ .v0 = 0, .v1 = 2, .v2 = 3, .n0 = 0xFFFFFFFF, .n1 = 0xFFFFFFFF, .n2 = 0xFFFFFFFF, .material_name = null }, data.faces[1]);
+}
+
+test "ply binary little endian matches ascii and skips extra vertex properties" {
+    const ascii_source =
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 4
+        \\property float x
+        \\property float y
+        \\property float z
+        \\property uchar confidence
+        \\element face 2
+        \\property list uchar int vertex_indices
+        \\end_header
+        \\0 0 0 7
+        \\1 0 0 8
+        \\1 1 0 9
+        \\0 1 0 10
+        \\3 0 1 2
+        \\3 0 2 3
+    ;
+    const binary_source =
+        "ply\n" ++ "format binary_little_endian 1.0\n" ++ "element vertex 4\n" ++
+        "property float x\n" ++ "property float y\n" ++ "property float z\n" ++ "property uchar confidence\n" ++
+        "element face 2\n" ++ "property list uchar int vertex_indices\n" ++ "end_header\n" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07" ++
+        "\x00\x00\x80\x3f\x00\x00\x00\x00\x00\x00\x00\x00\x08" ++
+        "\x00\x00\x80\x3f\x00\x00\x80\x3f\x00\x00\x00\x00\x09" ++
+        "\x00\x00\x00\x00\x00\x00\x80\x3f\x00\x00\x00\x00\x0a" ++
+        "\x03\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00" ++
+        "\x03\x00\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00";
+    const ascii_data = try parsePLYText(std.testing.allocator, ascii_source);
+    defer ascii_data.deinit();
+    const binary_data = try parsePLYText(std.testing.allocator, binary_source);
+    defer binary_data.deinit();
+    try expectSameMeshData(ascii_data, binary_data);
+}
+
+test "ply binary skips properties of every width, before and after the coordinates" {
+    // The 1-byte case alone does not exercise the width table: getting short
+    // or double wrong slides every later read by a few bytes and quietly
+    // produces a different mesh. Real scans carry exactly this mix -- Stanford
+    // files ship confidence and intensity floats alongside uchar colours.
+    const ascii_source =
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 3
+        \\property ushort id
+        \\property float x
+        \\property float y
+        \\property float z
+        \\property double weight
+        \\property uchar flag
+        \\element face 1
+        \\property list uchar int vertex_indices
+        \\end_header
+        \\258 0 0 0 1.0 7
+        \\259 1 0 0 1.0 8
+        \\260 1 1 0 1.0 9
+        \\3 0 1 2
+    ;
+
+    const one: []const u8 = "\x00\x00\x80\x3f"; // 1.0 as float32, little endian
+    const zero: []const u8 = "\x00\x00\x00\x00";
+    const weight: []const u8 = "\x00\x00\x00\x00\x00\x00\xf0\x3f"; // 1.0 as float64
+
+    const binary_source =
+        "ply\n" ++ "format binary_little_endian 1.0\n" ++ "element vertex 3\n" ++
+        "property ushort id\n" ++
+        "property float x\n" ++ "property float y\n" ++ "property float z\n" ++
+        "property double weight\n" ++ "property uchar flag\n" ++
+        "element face 1\n" ++ "property list uchar int vertex_indices\n" ++ "end_header\n" ++
+        "\x02\x01" ++ zero ++ zero ++ zero ++ weight ++ "\x07" ++
+        "\x03\x01" ++ one ++ zero ++ zero ++ weight ++ "\x08" ++
+        "\x04\x01" ++ one ++ one ++ zero ++ weight ++ "\x09" ++
+        "\x03\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00";
+
+    const ascii_data = try parsePLYText(std.testing.allocator, ascii_source);
+    defer ascii_data.deinit();
+    const binary_data = try parsePLYText(std.testing.allocator, binary_source);
+    defer binary_data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), binary_data.vertices.len);
+    try std.testing.expectEqual(Vec3{ 1, 1, 0 }, binary_data.vertices[2]);
+    try expectSameMeshData(ascii_data, binary_data);
+}
+
+test "ply nx ny nz properties become per-vertex normals" {
+    const source =
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 3
+        \\property float x
+        \\property float y
+        \\property float z
+        \\property float nx
+        \\property float ny
+        \\property float nz
+        \\property uchar red
+        \\property uchar green
+        \\property uchar blue
+        \\element face 1
+        \\property list uchar uint vertex_indices
+        \\end_header
+        \\0 0 0 0 0 1 255 0 0
+        \\1 0 0 0 1 0 0 255 0
+        \\0 1 0 1 0 0 0 0 255
+        \\3 0 1 2
+    ;
+    const data = try parsePLYText(std.testing.allocator, source);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 3), data.normals.len);
+    try std.testing.expectEqual(Vec3{ 0, 0, 1 }, data.normals[0]);
+    try std.testing.expectEqual(Vec3{ 0, 1, 0 }, data.normals[1]);
+    try std.testing.expectEqual(Vec3{ 1, 0, 0 }, data.normals[2]);
+    try std.testing.expect(data.faces[0].hasNormals());
+    try std.testing.expectEqual(@as(u32, 0), data.faces[0].n0);
+    try std.testing.expectEqual(@as(u32, 2), data.faces[0].n2);
+}
+
+test "ply polygon faces are fanned into triangles from the first vertex" {
+    const source =
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 4
+        \\property float x
+        \\property float y
+        \\property float z
+        \\element face 1
+        \\property list uchar int vertex_indices
+        \\end_header
+        \\0 0 0
+        \\1 0 0
+        \\1 1 0
+        \\0 1 0
+        \\4 0 1 2 3
+    ;
+    const data = try parsePLYText(std.testing.allocator, source);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 2), data.faces.len);
+    try std.testing.expectEqual(Face{ .v0 = 0, .v1 = 1, .v2 = 2, .n0 = 0xFFFFFFFF, .n1 = 0xFFFFFFFF, .n2 = 0xFFFFFFFF, .material_name = null }, data.faces[0]);
+    try std.testing.expectEqual(Face{ .v0 = 0, .v1 = 2, .v2 = 3, .n0 = 0xFFFFFFFF, .n1 = 0xFFFFFFFF, .n2 = 0xFFFFFFFF, .material_name = null }, data.faces[1]);
+}
+
+test "ply binary big endian is rejected explicitly" {
+    try std.testing.expectError(error.UnsupportedFormat, parsePLYText(std.testing.allocator,
+        \\ply
+        \\format binary_big_endian 1.0
+        \\element vertex 0
+        \\end_header
+    ));
+}
+
+test "ply malformed and truncated input is rejected" {
+    try std.testing.expectError(error.MissingData, parsePLYText(std.testing.allocator,
+        \\ply
+        \\format ascii 1.0
+        \\element vertex 1
+        \\property float x
+        \\property float y
+        \\property float z
+        \\end_header
+        \\0 1
+    ));
+    const truncated_binary = "ply\n" ++ "format binary_little_endian 1.0\n" ++ "element vertex 1\n" ++ "property float x\n" ++ "property float y\n" ++ "property float z\n" ++ "end_header\n" ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+    try std.testing.expectError(error.MissingData, parsePLYText(std.testing.allocator, truncated_binary));
 }
