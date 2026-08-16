@@ -2803,10 +2803,6 @@ const RenderContext = struct {
 /// where it is least welcome.
 const roulette_min_bounces: i32 = 4;
 
-/// Ceiling on the survival probability, so that even a path losing nothing --
-/// glass, which absorbs none of it -- still has a way out.
-const roulette_max_survival: f64 = 0.95;
-
 fn rayColor(ctx: RenderContext, ray: Ray, rng: std.Random) Color {
     // A camera ray sees emitters directly: nothing has sampled them yet, and
     // it has lost nothing on the way in.
@@ -2902,11 +2898,25 @@ fn rayColorInner(
             // the same as one that has just left the camera. Ending it early
             // and dividing the survivors by the odds of surviving leaves the
             // average untouched.
+            //
+            // The survival odds are the throughput itself, and nothing caps
+            // them below 1. A path that has lost nothing is therefore never
+            // killed -- which matters most for glass, where two things coincide
+            // badly. Glass absorbs none of the light, so killing it discards a
+            // sample at full strength; and glass gathers nothing locally, so
+            // the discarded sample is not merely dim but black. Rolling against
+            // a ceiling of 0.95 ended a quarter of the paths through the glass
+            // dragon that way, and every one of them was a black pixel among
+            // lit ones.
+            //
+            // What stops a lossless path instead is `max_depth`, which is there
+            // for exactly this: total internal reflection can otherwise bounce
+            // around inside a solid forever.
             var carried = mulVec(throughput, attenuation);
             var compensated = attenuation;
 
             if (ctx.max_depth - depth >= roulette_min_bounces) {
-                const survival = @min(@max(@max(carried[0], carried[1]), carried[2]), roulette_max_survival);
+                const survival = @min(@max(@max(carried[0], carried[1]), carried[2]), 1.0);
                 if (randomFloat(rng) >= survival) {
                     if (stats) |s| s.roulette_killed = true;
                     return local;
@@ -3270,6 +3280,9 @@ fn probePixel(
     var spread = SampleSpread{};
     var flipped_samples: u32 = 0;
     var outliers: u32 = 0;
+    var killed: u32 = 0;
+    var killed_black: u32 = 0;
+    var exhausted: u32 = 0;
 
     var sample: u32 = 0;
     while (sample < samples) : (sample += 1) {
@@ -3277,6 +3290,15 @@ fn probePixel(
         var stats = PathStats{ .trace = &trace };
         const radiance = rayColorInner(ctx, camera.getRay(x, y, rng), ctx.max_depth, rng, true, Color{ 1, 1, 1 }, &stats);
         if (stats.dielectric_normal_flips > 0) flipped_samples += 1;
+        if (stats.exhausted) exhausted += 1;
+        if (stats.roulette_killed) {
+            killed += 1;
+            // A path killed on glass returns whatever the surface contributed
+            // locally, and glass contributes nothing: no emission, and neither
+            // direct light nor caustics are gathered on a specular surface. So
+            // the sample is not merely dimmed, it is black.
+            if (luminance(radiance) <= 0.0) killed_black += 1;
+        }
 
         const l = luminance(radiance);
         // Compared against the mean of the samples before this one, so the test
@@ -3328,6 +3350,11 @@ fn probePixel(
         .{ spread.mean(), spread.max, spread.peakRatio(), spread.relativeDeviation() },
     );
     std.debug.print("  samples more than 10x the running mean: {d}/{d}\n", .{ outliers, samples });
+    std.debug.print(
+        "  ended by roulette: {d}/{d} ({d} of them returning pure black)\n",
+        .{ killed, samples, killed_black },
+    );
+    std.debug.print("  ended by hitting the depth ceiling: {d}/{d}\n", .{ exhausted, samples });
     std.debug.print("  samples with a normal flip on glass: {d}/{d}\n\n", .{ flipped_samples, samples });
 }
 
@@ -3780,7 +3807,31 @@ const StudioOptions = struct {
     floor: f64 = 14.0,
     floor_color: Color = Color{ 0.58, 0.56, 0.52 },
     /// Radiance of the panel overhead.
+    ///
+    /// This and `panel_scale` together decide how noisy a glass model looks,
+    /// and they are worth understanding before either is changed. The floor
+    /// finds this lamp by sampling it directly, so the floor is smooth however
+    /// bright it is. Glass cannot: a path through it can only stumble onto the
+    /// lamp by chance, and when it does it brings back the full radiance below.
+    /// A small, fierce lamp therefore leaves the floor clean and the glass
+    /// speckled, from the same light.
+    ///
+    /// Widening the panel and dimming it by the square keeps the total power,
+    /// the exposure and the caustic's position identical while cutting that
+    /// variance. Measured on `glass-dragon` at 600x338, 512 samples, over the
+    /// dragon's flank:
+    ///
+    ///   panel_scale  emission   noise   relative deviation
+    ///   0.55         26.0       25.7    5.88   (default: hard light)
+    ///   0.85         10.9       21.4    --
+    ///   1.10          6.5       19.5    2.86   (soft light)
+    ///
+    /// The default keeps the hard light, because the crisp shadow and the
+    /// tightly focused caustic are what these scenes exist to show. Soften it
+    /// when a clean glass surface matters more than a sharp shadow.
     emission: Color = Color{ 26.0, 25.0, 24.0 },
+    /// Width of the panel as a fraction of the model's longest side.
+    panel_scale: f64 = 0.55,
     photons: PhotonBudget = .{},
 };
 
@@ -3851,7 +3902,7 @@ fn buildStudioScene(
     };
 
     // A panel over the model, high enough to light the floor around it.
-    const panel_side = reach * 0.55;
+    const panel_side = reach * options.panel_scale;
     const panel_corner = Point3{
         center[0] - panel_side / 2.0,
         model_box.y.max + reach * 0.9,
@@ -4905,6 +4956,90 @@ test "an area light is sampled from its front face and through nothing solid" {
 
     const blocked = light.sampleDirect(blocked_world, Point3{ 0, 0, 0 }, Vec3{ 0, 1, 0 }, albedo, rng);
     try std.testing.expectEqual(Color{ 0, 0, 0 }, blocked);
+}
+
+test "roulette never kills a path that has lost no energy" {
+    const allocator = std.testing.allocator;
+
+    // Two perfect mirrors facing each other, and a ray bouncing straight
+    // between them. Metal with albedo 1 and no fuzz takes nothing from the
+    // path, so its throughput stays exactly 1 however far it goes -- the same
+    // condition a ray inside glass is in, arranged so it cannot end early.
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ 0, 1, 0 },
+        .lookat = Point3{ 0, 0, 0 },
+        .vfov = 40.0,
+    });
+    defer scene.deinit();
+
+    const mirror = Material.metal(Color{ 1, 1, 1 }, 0.0);
+    try scene.addQuad(Point3{ -2, 0, -2 }, Vec3{ 4, 0, 0 }, Vec3{ 0, 0, 4 }, mirror);
+    try scene.addQuad(Point3{ -2, 2, -2 }, Vec3{ 4, 0, 0 }, Vec3{ 0, 0, 4 }, mirror);
+
+    const world = try BVH.init(allocator, scene.primitives.items);
+    defer world.deinit();
+
+    const ctx = RenderContext{
+        .world = world,
+        .background = .{ .solid = Color{ 0, 0, 0 } },
+        .max_depth = 20,
+    };
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const rng = prng.random();
+
+    // Well past `roulette_min_bounces`, so roulette gets many chances to fire.
+    for (0..64) |_| {
+        var stats = PathStats{};
+        _ = rayColorInner(ctx, Ray.init(Point3{ 0, 1, 0 }, Vec3{ 0, -1, 0 }), ctx.max_depth, rng, true, Color{ 1, 1, 1 }, &stats);
+
+        // Capping survival at 0.95 used to end roughly half of these, and on a
+        // specular surface an ended path brings back nothing at all.
+        try std.testing.expect(!stats.roulette_killed);
+        try std.testing.expect(stats.exhausted);
+        try std.testing.expectEqual(@as(u32, 20), stats.bounces);
+    }
+}
+
+test "roulette still ends a path once the path has gone dim" {
+    const allocator = std.testing.allocator;
+
+    // A ray shut inside a very dark diffuse sphere. Every bounce keeps a fifth
+    // of the light, so the throughput collapses and roulette should step in --
+    // which is the whole point of it, and must survive the change above.
+    var scene = SceneData.init(allocator, CameraSpec{
+        .lookfrom = Point3{ 0, 0, 0 },
+        .lookat = Point3{ 0, 0, -1 },
+        .vfov = 40.0,
+    });
+    defer scene.deinit();
+
+    try scene.addSphere(Sphere.init(Point3{ 0, 0, 0 }, 50.0, Material.lambertian(Color{ 0.2, 0.2, 0.2 })));
+
+    const world = try BVH.init(allocator, scene.primitives.items);
+    defer world.deinit();
+
+    const ctx = RenderContext{
+        .world = world,
+        .background = .{ .solid = Color{ 0, 0, 0 } },
+        .max_depth = 40,
+    };
+
+    var prng = std.Random.DefaultPrng.init(4);
+    const rng = prng.random();
+
+    var killed: u32 = 0;
+    const trials = 64;
+    for (0..trials) |_| {
+        var stats = PathStats{};
+        _ = rayColorInner(ctx, Ray.init(Point3{ 0, 0, 0 }, Vec3{ 0, 0, -1 }), ctx.max_depth, rng, true, Color{ 1, 1, 1 }, &stats);
+        if (stats.roulette_killed) killed += 1;
+    }
+
+    // Throughput is 0.2^4 by the time roulette is allowed to fire, so in
+    // practice it ends every one of them; requiring most is enough to show it
+    // still works without pinning the test to the exact albedo.
+    try std.testing.expect(killed > trials / 2);
 }
 
 test "emission stops being counted once a path has touched a diffuse surface" {
