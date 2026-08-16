@@ -60,18 +60,30 @@ make preview SCENE=cornell-box
 | `cover` (default) | committed models | The book's cover: random spheres, a diamond teapot and a cube, under a sky |
 | `cornell-box` | nothing | The closed Cornell box, lit only by a panel set into its ceiling, with a glass and a metal sphere |
 | `glass-dragon` | `make models` | The XYZ RGB Asian Dragon in glass, 249,882 triangles, lit by a panel against a dark sky |
+| `glass-bunny` | `make models` | The Stanford bunny in glass, 69,451 triangles: the same studio, quick enough to iterate on |
+| `spot` | `make models` | Spot the cow under a daylit sky, with a glass sphere for company |
 
 Without `--scene` the cover scene is rendered, which is also what CI renders,
 so the default must never depend on a fetched model.
+
+`glass-dragon` and `glass-bunny` are the same studio — one model on a floor
+under a panel, against a near-black sky — pointed at different models. The
+camera and the lamp are placed from the model's own fitted bounds, so aiming it
+at something else needs no new constants. Reach for the bunny when changing
+anything about caustics: it builds its BVH in 0.76s against the dragon's 3.6s
+and still throws a proper caustic.
 
 Two things a scene decides for itself, beyond geometry:
 
 - **Its background.** `cornell-box` is only closed because its background is
   black; with the sky gradient, daylight would pour in through the open wall
   the camera looks through.
-- **Its photon budget.** A closed room turns about 41% of emitted photons into
-  stored caustic photons, against roughly 7% for the open cover scene, so one
-  global budget does not fit both.
+- **Its photon budget.** How much of the emitted light comes back as stored
+  caustic photons varies by nearly a factor of five, so one global budget does
+  not fit: about 41% for the closed Cornell box, 32% for the bunny and for
+  Spot's single glass sphere, and roughly 7% for the open cover scene. Setting
+  it too low is not silent — emission stops early and the renderer says the
+  caustics are missing the light it never emitted.
 
 ## Models
 
@@ -87,6 +99,18 @@ make models-verify   # re-check what is already there
 bytes. Downloads land in a `.part` file and are only moved into place once the
 checksum matches, so a failed or corrupted fetch never leaves behind something
 that looks like a model. Sources are pinned to a commit, not a branch.
+
+| Model | Triangles | Used by |
+| --- | --- | --- |
+| `test_cube.obj`, `teapot.obj` | 12, 6,320 | `cover` (committed) |
+| `xyzrgb_dragon.obj` | 249,882 | `glass-dragon` |
+| `stanford-bunny.obj` | 69,451 | `glass-bunny` |
+| `spot.obj` | 5,856 | `spot` |
+
+A test checks that every model a scene asks for is listed in the manifest, so a
+scene pointing at something nobody can fetch fails the build rather than the
+render. The manifest is embedded at compile time for this, which is why
+`build.zig` hands it to the test module.
 
 Note that this sha256 is of the file itself, which is **not** the SHA the
 GitHub API reports for a blob — that one is `sha1("blob <len>\0" + content)`.
@@ -272,7 +296,9 @@ Stage timings at 500x281 and 80 samples on 16 threads, which is what the
 | Scene | Primitives | Scene build | BVH build | Caustics | Render |
 | --- | --- | --- | --- | --- | --- |
 | `cover` | 6,817 | 3.7ms | 21.0ms | 705.9ms | 3.7s |
+| `spot` | 5,859 | 3.9ms | 29.6ms | 756.0ms | 7.7s |
 | `cornell-box` | 20 | 42.9us | 21.0us | 447.0ms | 3m15s |
+| `glass-bunny` | 69,455 | 33.1ms | 771.9ms | 9.3s | 45.6s |
 | `glass-dragon` | 249,886 | 175.9ms | 3.6s | 12.6s | 13.7s |
 
 Parsing 11.3 MB of OBJ and generating smooth normals for a quarter of a million
@@ -281,6 +307,12 @@ triangles costs 176ms, which is nothing. The BVH build is the one to watch:
 render. The closed Cornell box is the surprise — 20 primitives and by far the
 slowest render, because no path ever escapes it and every one runs the full 50
 bounces.
+
+Triangle count is not what makes a render slow, though. The bunny has a quarter
+of the dragon's triangles and takes three times as long, because what costs is
+how much glass a ray has to fight its way through: the bunny is a solid lump of
+it, where the dragon is mostly thin limbs with background between them. Rays
+that miss are cheap.
 
 ## References
 
