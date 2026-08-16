@@ -23,7 +23,25 @@ PREVIEW_SAMPLES ?= 10
 IMAGE ?= image
 
 # Scene to render. Empty means the binary's default (the book cover scene).
-# List them with: make scenes
+#
+# Each scene brings its own model, and everything except the cover and the
+# Cornell box needs 'make models' first (those models are fetched, not
+# committed). Rendering each of them:
+#
+#   make preview                      # cover: teapot + cube, committed
+#   make preview SCENE=cornell-box    # no model at all, just quads
+#   make models                       # fetch the rest, sha256 verified
+#   make preview SCENE=glass-dragon   # xyzrgb_dragon.obj, 249,882 triangles
+#   make preview SCENE=glass-bunny    # stanford-bunny.obj, 69,451 triangles
+#   make preview SCENE=spot           # spot.obj, 5,856 triangles
+#
+# SCENE works on every run/bench target too, not just preview:
+#
+#   make run-release SCENE=glass-bunny
+#   make bench-release SCENE=spot
+#   make preview SCENE=spot view      # render, convert to PNG, open it
+#
+# Ask the binary rather than this comment if they ever disagree: make scenes
 SCENE ?=
 SCENE_ARG = $(if $(SCENE),--scene=$(SCENE),)
 
@@ -81,6 +99,14 @@ help:
 	@echo "    make preview SCENE=cornell-box     # Preview a different scene"
 	@echo "    make run view                      # Render, then open the result"
 	@echo "    make view IMAGE=image-release      # View an already-rendered image"
+	@echo ""
+	@echo "Rendering each model ('make scenes' is the authoritative list):"
+	@echo "  make preview                       # cover: teapot + cube, committed"
+	@echo "  make preview SCENE=cornell-box     # no model at all, just quads"
+	@echo "  make models                        # fetch the rest, sha256 verified"
+	@echo "  make preview SCENE=glass-dragon    # xyzrgb_dragon.obj, 249,882 tris"
+	@echo "  make preview SCENE=glass-bunny     # stanford-bunny.obj, 69,451 tris"
+	@echo "  make preview SCENE=spot            # spot.obj, 5,856 tris"
 
 # Build targets
 build: build-debug
