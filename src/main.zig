@@ -1005,6 +1005,63 @@ const BVH = struct {
     }
 };
 
+/// Where a primitive sits along one axis, which is what a split orders by.
+inline fn primitiveCentroid(primitive: Primitive, axis: usize) f64 {
+    // Coerced to an array because a @Vector cannot be indexed by a value only
+    // known at run time, and the axis is chosen per node.
+    const center: [3]f64 = switch (primitive) {
+        .sphere => |s| s.center,
+        .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0),
+    };
+    return center[axis];
+}
+
+/// Move the element that belongs at `n` to `n`, with everything ordering
+/// before it ahead of it and everything after behind. Neither side is sorted.
+///
+/// Quickselect, because the build only ever needs the median. Sorting the whole
+/// slice at every node made the build O(n log^2 n) and spent most of that
+/// re-sorting data an ancestor had already put in order.
+fn selectNth(primitives: []Primitive, n: usize, axis: usize) void {
+    if (primitives.len <= 1) return;
+
+    var lo: usize = 0;
+    var hi: usize = primitives.len - 1;
+
+    while (lo < hi) {
+        // Median of three. Data arriving here is often already ordered on this
+        // axis, since an ancestor split on it, and that is exactly the input
+        // that makes a first-element pivot quadratic.
+        const mid = lo + (hi - lo) / 2;
+        const a = primitiveCentroid(primitives[lo], axis);
+        const b = primitiveCentroid(primitives[mid], axis);
+        const c = primitiveCentroid(primitives[hi], axis);
+        const pivot = @max(@min(a, b), @min(@max(a, b), c));
+
+        var i = lo;
+        var j = hi;
+        while (i <= j) {
+            while (primitiveCentroid(primitives[i], axis) < pivot) i += 1;
+            while (primitiveCentroid(primitives[j], axis) > pivot) j -= 1;
+            if (i > j) break;
+
+            std.mem.swap(Primitive, &primitives[i], &primitives[j]);
+            i += 1;
+            if (j == 0) break;
+            j -= 1;
+        }
+
+        // Keep only the side that still contains n, and stop once it is placed.
+        if (n <= j and j > lo) {
+            hi = j;
+        } else if (n >= i and i < hi) {
+            lo = i;
+        } else {
+            break;
+        }
+    }
+}
+
 fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_offset: u32, nodes: []BVHNode, node_count: *usize) !u32 {
     const node_idx = @as(u32, @intCast(node_count.*));
     node_count.* += 1;
@@ -1025,32 +1082,11 @@ fn buildBVH(allocator: std.mem.Allocator, primitives: []Primitive, primitive_off
     // Choose split axis (longest bbox axis)
     const axis = bbox.longestAxis();
 
-    // Sort primitives along chosen axis
-    const SortContext = struct {
-        axis_idx: usize,
-
-        pub fn lessThan(ctx: @This(), a: Primitive, b: Primitive) bool {
-            // Compute center/centroid for each primitive type
-            const a_center = switch (a) {
-                .sphere => |s| s.center,
-                .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0), // Triangle centroid
-            };
-            const b_center = switch (b) {
-                .sphere => |s| s.center,
-                .triangle => |t| div(add(add(t.v0, t.v1), t.v2), 3.0),
-            };
-            return switch (ctx.axis_idx) {
-                0 => a_center[0] < b_center[0],
-                1 => a_center[1] < b_center[1],
-                else => a_center[2] < b_center[2],
-            };
-        }
-    };
-
-    std.mem.sort(Primitive, primitives, SortContext{ .axis_idx = axis }, SortContext.lessThan);
-
-    // Split in the middle
+    // Put the median in place, with everything ordering before it ahead of it.
+    // The split only cares which primitives fall on each side, not what order
+    // they sit in once there.
     const mid = primitives.len / 2;
+    selectNth(primitives, mid, axis);
 
     // Recursively build left and right subtrees
     const left_idx = try buildBVH(allocator, primitives[0..mid], primitive_offset, nodes, node_count);
@@ -4008,4 +4044,78 @@ test "an obj with no faces yields an empty mesh rather than an error" {
 
     try std.testing.expectEqual(@as(usize, 2), data.vertices.len);
     try std.testing.expectEqual(@as(usize, 0), data.faces.len);
+}
+// ============================================================================
+// Tests - BVH Construction
+// ============================================================================
+
+test "selectNth puts the median in place and everything smaller before it" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+
+    const material = Material.lambertian(Color{ 0.5, 0.5, 0.5 });
+
+    // Ordered, reversed, shuffled, and all-equal. The last is the one that
+    // makes a Hoare partition loop forever if the scan bounds are wrong, and
+    // it is not exotic: a wall of coplanar triangles has one centroid.
+    const layouts = [_][]const u8{ "ordered", "reversed", "shuffled", "equal" };
+
+    for (layouts) |layout| {
+        for ([_]usize{ 1, 2, 3, 8, 33, 64 }) |count| {
+            const primitives = try allocator.alloc(Primitive, count);
+            defer allocator.free(primitives);
+
+            for (primitives, 0..) |*primitive, i| {
+                const x: f64 = if (std.mem.eql(u8, layout, "equal"))
+                    1.0
+                else if (std.mem.eql(u8, layout, "reversed"))
+                    @floatFromInt(count - i)
+                else
+                    @floatFromInt(i);
+                primitive.* = Primitive{ .sphere = Sphere.init(Point3{ x, 0, 0 }, 0.1, material) };
+            }
+
+            if (std.mem.eql(u8, layout, "shuffled")) rng.shuffle(Primitive, primitives);
+
+            const n = count / 2;
+            selectNth(primitives, n, 0);
+
+            const pivot = primitiveCentroid(primitives[n], 0);
+            for (primitives[0..n]) |before| {
+                try std.testing.expect(primitiveCentroid(before, 0) <= pivot);
+            }
+            for (primitives[n + 1 ..]) |after| {
+                try std.testing.expect(primitiveCentroid(after, 0) >= pivot);
+            }
+        }
+    }
+}
+
+test "selectNth keeps every primitive it was given" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(23);
+    const rng = prng.random();
+
+    const material = Material.lambertian(Color{ 0.5, 0.5, 0.5 });
+    const count = 128;
+
+    const primitives = try allocator.alloc(Primitive, count);
+    defer allocator.free(primitives);
+    for (primitives, 0..) |*primitive, i| {
+        primitive.* = Primitive{ .sphere = Sphere.init(Point3{ @floatFromInt(i), 0, 0 }, 0.1, material) };
+    }
+    rng.shuffle(Primitive, primitives);
+
+    selectNth(primitives, count / 2, 0);
+
+    // Partitioning may reorder, but losing or duplicating a primitive would
+    // drop geometry out of the scene, which the render would show as a hole.
+    var seen = [_]bool{false} ** count;
+    for (primitives) |primitive| {
+        const i: usize = @intFromFloat(primitive.sphere.center[0]);
+        try std.testing.expect(!seen[i]);
+        seen[i] = true;
+    }
+    for (seen) |s| try std.testing.expect(s);
 }
