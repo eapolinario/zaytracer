@@ -231,6 +231,33 @@ fn reflectance(cosine: f64, refraction_index: f64) f64 {
     return r0 + (1.0 - r0) * std.math.pow(f64, 1.0 - cosine, 5);
 }
 
+/// Where a ray goes when it meets glass, and whether it went through.
+const BentRay = struct {
+    direction: Vec3,
+    transmitted: bool,
+};
+
+/// Choose between refraction and reflection at a dielectric boundary.
+///
+/// `n` faces the incoming ray and `etai_over_etat` is the ratio of indices in
+/// the direction the ray is travelling. Total internal reflection leaves no
+/// choice; otherwise Schlick's approximation decides, and the caller's random
+/// draw picks one path rather than tracing both.
+///
+/// Separate from `Material.scatter` because it gets called twice there: once
+/// about the shading normal, and again about the triangle's own normal when the
+/// first answer turns out to be geometrically impossible.
+fn bendRay(unit_direction: Vec3, n: Vec3, etai_over_etat: f64, rng: std.Random) BentRay {
+    const cos_theta = @min(dot(neg(unit_direction), n), 1.0);
+    const sin_theta = @sqrt(@max(1.0 - cos_theta * cos_theta, 0.0));
+
+    const cannot_refract = etai_over_etat * sin_theta > 1.0;
+    if (cannot_refract or reflectance(cos_theta, etai_over_etat) > randomFloat(rng)) {
+        return .{ .direction = reflect(unit_direction, n), .transmitted = false };
+    }
+    return .{ .direction = refract(unit_direction, n, etai_over_etat), .transmitted = true };
+}
+
 // ============================================================================
 // Material
 // ============================================================================
@@ -336,19 +363,39 @@ const Material = struct {
             },
             .dielectric => {
                 attenuation.* = Color{ 1.0, 1.0, 1.0 };
-                const ri = if (rec.front_face) (1.0 / self.refraction_index) else self.refraction_index;
+
+                // Which side of the glass the ray is on is a question about the
+                // solid, not about the shading. On a smooth-shaded mesh the
+                // interpolated normal can tilt past the plane of its own
+                // triangle, and then it claims a ray leaving the glass is
+                // entering it. That inverts the index of refraction, which
+                // usually forces a total internal reflection that should never
+                // have happened -- a bright or black pixel among its
+                // neighbours, which is what the speckle on a smooth-shaded
+                // dielectric is made of.
+                const ri = if (rec.geometric_front_face) (1.0 / self.refraction_index) else self.refraction_index;
 
                 const unit_direction = unitVector(ray_in.direction);
-                const cos_theta = @min(dot(neg(unit_direction), rec.normal), 1.0);
-                const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
+                const bent = bendRay(unit_direction, rec.normal, ri, rng);
 
-                const cannot_refract = ri * sin_theta > 1.0;
-                const direction = if (cannot_refract or reflectance(cos_theta, ri) > randomFloat(rng))
-                    reflect(unit_direction, rec.normal)
+                // Refraction has to leave through the far side of the surface
+                // and reflection has to stay on the near side. Bending light
+                // about an interpolated normal guarantees neither, and a
+                // direction on the wrong side puts the ray back inside the
+                // solid it just left, where it re-hits the same triangle at the
+                // shadow-acne epsilon and wanders off carrying noise.
+                //
+                // `geometric_normal` faces the incoming ray, so a reflection
+                // must have a positive component along it and a refraction a
+                // negative one. The triangle's own normal is both the arbiter
+                // and the fallback: it is the one normal the surface has.
+                const side = dot(bent.direction, rec.geometric_normal);
+                const consistent = if (bent.transmitted) side < 0 else side > 0;
+
+                scattered.* = Ray.init(rec.point, if (consistent)
+                    bent.direction
                 else
-                    refract(unit_direction, rec.normal, ri);
-
-                scattered.* = Ray.init(rec.point, direction);
+                    bendRay(unit_direction, rec.geometric_normal, ri, rng).direction);
                 return true;
             },
             .diffuse_light => {
@@ -649,14 +696,32 @@ const AABB = struct {
 
 const HitRecord = struct {
     point: Point3,
+    /// The normal used for shading. On a smooth-shaded mesh this is
+    /// interpolated across the triangle and is not perpendicular to it.
     normal: Vec3,
+    /// The normal the surface actually has: perpendicular to the triangle that
+    /// was hit. Refraction needs this to tell which side of the glass the ray
+    /// is really on, because the interpolated normal can disagree.
+    geometric_normal: Vec3,
     material: Material,
     t: f64,
+    /// Whether the ray struck the outward side, according to `normal`.
     front_face: bool,
+    /// The same question answered by `geometric_normal`. The two disagree near
+    /// silhouettes, where interpolation tilts the shading normal past the
+    /// plane of the triangle.
+    geometric_front_face: bool,
 
-    pub fn setFaceNormal(self: *HitRecord, ray: Ray, outward_normal: Vec3) void {
-        self.front_face = dot(ray.direction, outward_normal) < 0;
-        self.normal = if (self.front_face) outward_normal else neg(outward_normal);
+    /// Record both normals, each turned to face the incoming ray.
+    ///
+    /// `outward_shading` may equal `outward_geometric` -- on a sphere, or on a
+    /// flat-shaded triangle, there is only one normal to speak of.
+    pub fn setFaceNormal(self: *HitRecord, ray: Ray, outward_shading: Vec3, outward_geometric: Vec3) void {
+        self.front_face = dot(ray.direction, outward_shading) < 0;
+        self.normal = if (self.front_face) outward_shading else neg(outward_shading);
+
+        self.geometric_front_face = dot(ray.direction, outward_geometric) < 0;
+        self.geometric_normal = if (self.geometric_front_face) outward_geometric else neg(outward_geometric);
     }
 };
 
@@ -704,7 +769,7 @@ const Sphere = struct {
         rec.point = ray.at(rec.t);
         rec.material = self.material;
         const outward_normal = div(sub(rec.point, self.center), self.radius);
-        rec.setFaceNormal(ray, outward_normal);
+        rec.setFaceNormal(ray, outward_normal, outward_normal);
 
         return true;
     }
@@ -849,6 +914,12 @@ const Triangle = struct {
         // These are weights for (v0, v1, v2)
         const w = 1.0 - u - v;
 
+        // The triangle's own normal. `pvec` is already cross(direction, edge2),
+        // so this cannot reuse it; the cross product is recomputed instead of
+        // stored, to keep Triangle small enough to stay cache-friendly across
+        // a quarter of a million of them.
+        const geometric_normal = unitVector(cross(self.edge1, self.edge2));
+
         const outward_normal = if (self.has_normals)
             // SMOOTH SHADING: Interpolate vertex normals
             unitVector(add(add(mul(self.n0, w), mul(self.n1, u)), mul(self.n2, v)))
@@ -856,7 +927,7 @@ const Triangle = struct {
             // FLAT SHADING: Use face normal
             self.n0;
 
-        rec.setFaceNormal(ray, outward_normal);
+        rec.setFaceNormal(ray, outward_normal, geometric_normal);
 
         return true;
     }
@@ -2743,7 +2814,7 @@ fn rayColor(ctx: RenderContext, ray: Ray, rng: std.Random) Color {
     // The depth budget comes from the context rather than the caller: roulette
     // works out how deep a path is by subtracting what is left from it, and a
     // caller passing a different number would silently misjudge that.
-    return rayColorInner(ctx, ray, ctx.max_depth, rng, true, Color{ 1, 1, 1 });
+    return rayColorInner(ctx, ray, ctx.max_depth, rng, true, Color{ 1, 1, 1 }, null);
 }
 
 /// `count_emission` says whether hitting a light should add its emission.
@@ -2760,9 +2831,18 @@ fn rayColor(ctx: RenderContext, ray: Ray, rng: std.Random) Color {
 /// the camera: looking at the lamp, or at its reflection, or at it through
 /// glass. Without a photon map nothing else covers specular paths, so there
 /// they are counted and the renderer degrades to plain path tracing.
-fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, count_emission: bool, throughput: Color) Color {
+fn rayColorInner(
+    ctx: RenderContext,
+    ray: Ray,
+    depth: i32,
+    rng: std.Random,
+    count_emission: bool,
+    throughput: Color,
+    stats: ?*PathStats,
+) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
+        if (stats) |s| s.exhausted = true;
         return Color{ 0, 0, 0 };
     }
 
@@ -2771,6 +2851,8 @@ fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, coun
     if (ctx.world.hit(ray, Interval{ .min = 0.001, .max = std.math.inf(f64) }, &rec)) {
         var scattered: Ray = undefined;
         var attenuation: Color = undefined;
+
+        if (stats) |s| s.record(rec, ctx.max_depth - depth);
 
         const emitted = if (count_emission) rec.material.emitted(rec.front_face) else Color{ 0, 0, 0 };
 
@@ -2803,6 +2885,7 @@ fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, coun
         const local = add(add(emitted, direct), caustics_contribution);
 
         if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
+            if (stats) |s| s.recordScatter(rec, scattered);
             const bounce_counts_emission = if (!isSpecular(rec.material.material_type))
                 // Direct sampling covered the light here, and the caustic map
                 // covers it arriving through anything specular further on.
@@ -2824,19 +2907,428 @@ fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, coun
 
             if (ctx.max_depth - depth >= roulette_min_bounces) {
                 const survival = @min(@max(@max(carried[0], carried[1]), carried[2]), roulette_max_survival);
-                if (randomFloat(rng) >= survival) return local;
+                if (randomFloat(rng) >= survival) {
+                    if (stats) |s| s.roulette_killed = true;
+                    return local;
+                }
 
                 compensated = div(attenuation, survival);
                 carried = div(carried, survival);
             }
 
-            const indirect = rayColorInner(ctx, scattered, depth - 1, rng, bounce_counts_emission, carried);
+            const indirect = rayColorInner(ctx, scattered, depth - 1, rng, bounce_counts_emission, carried, stats);
             return add(local, mulVec(compensated, indirect));
         }
+        if (stats) |s| s.recordScatter(rec, null);
         return local;
     }
 
+    if (stats) |s| s.escaped = true;
     return ctx.background.sample(ray.direction);
+}
+
+// ============================================================================
+// Diagnostics
+// ============================================================================
+
+/// One surface a probed path touched. Only filled in for `--probe`, which
+/// follows a handful of paths through a single pixel and prints them.
+const TraceEntry = struct {
+    t: f64,
+    material: MaterialType,
+    /// Which side the shading normal says the ray arrived on.
+    front_face: bool,
+    /// Which side the triangle itself says. When these differ, a dielectric has
+    /// just used the wrong index of refraction.
+    geometric_front_face: bool,
+    /// How far the shading normal has been bent away from the surface, as the
+    /// cosine between the two. 1.0 is a flat-shaded hit.
+    normal_agreement: f64,
+    /// Whether the scattered ray crossed to the far side of the surface. For
+    /// glass this separates transmission from reflection, and it is measured
+    /// against the geometric normal, so it reports what really happened rather
+    /// than what the shading normal intended.
+    transmitted: bool,
+    scattered: bool,
+};
+
+const trace_capacity = 64;
+
+const Trace = struct {
+    entries: [trace_capacity]TraceEntry = undefined,
+    len: usize = 0,
+
+    fn push(self: *Trace, entry: TraceEntry) void {
+        if (self.len >= trace_capacity) return;
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+};
+
+/// What one camera path did, recorded while the ordinary renderer traces it.
+///
+/// The debug views run the real `rayColorInner` with one of these attached
+/// rather than a simplified copy of it. A second implementation would answer
+/// questions about itself, which is exactly the wrong thing for a tool whose
+/// job is to explain what the renderer is doing.
+const PathStats = struct {
+    /// Surfaces struck before the path ended.
+    bounces: u32 = 0,
+    /// The path ran out of `max_depth` and returned black.
+    exhausted: bool = false,
+    /// Russian roulette ended the path.
+    roulette_killed: bool = false,
+    /// The path left the scene and took the background colour.
+    escaped: bool = false,
+
+    /// Hits where the interpolated shading normal and the triangle's own normal
+    /// disagreed about which side of the surface the ray arrived on.
+    ///
+    /// On a dielectric this picks the wrong index of refraction -- 1.5 for a
+    /// ray entering glass instead of 1/1.5 -- which usually forces a spurious
+    /// total internal reflection.
+    normal_flips: u32 = 0,
+    /// Of those, how many were on a dielectric, where it actually changes the
+    /// physics rather than just tilting a diffuse shading term.
+    dielectric_normal_flips: u32 = 0,
+
+    /// Details of the first surface the camera ray met, for the views that ask
+    /// about visible geometry rather than about the path as a whole.
+    first_hit: bool = false,
+    first_normal: Vec3 = Vec3{ 0, 0, 0 },
+    first_geometric_normal: Vec3 = Vec3{ 0, 0, 0 },
+    first_material: MaterialType = .lambertian,
+    first_t: f64 = 0,
+
+    /// Set only by `--probe`, which wants the whole path rather than a summary.
+    trace: ?*Trace = null,
+
+    fn record(self: *PathStats, rec: HitRecord, bounce_index: i32) void {
+        self.bounces += 1;
+
+        if (rec.front_face != rec.geometric_front_face) {
+            self.normal_flips += 1;
+            if (rec.material.material_type == .dielectric) self.dielectric_normal_flips += 1;
+        }
+
+        if (bounce_index == 0) {
+            self.first_hit = true;
+            self.first_normal = rec.normal;
+            self.first_geometric_normal = rec.geometric_normal;
+            self.first_material = rec.material.material_type;
+            self.first_t = rec.t;
+        }
+    }
+
+    /// Called after `scatter`, which is the first point at which the outgoing
+    /// direction is known.
+    fn recordScatter(self: *PathStats, rec: HitRecord, scattered: ?Ray) void {
+        const trace = self.trace orelse return;
+        trace.push(TraceEntry{
+            .t = rec.t,
+            .material = rec.material.material_type,
+            .front_face = rec.front_face,
+            .geometric_front_face = rec.geometric_front_face,
+            .normal_agreement = dot(rec.normal, rec.geometric_normal),
+            .transmitted = if (scattered) |s| dot(s.direction, rec.geometric_normal) < 0 else false,
+            .scattered = scattered != null,
+        });
+    }
+};
+
+/// False-colour renders that answer one question each about a scene.
+///
+/// Selected with `--debug=<name>`; `off` is the ordinary render.
+const DebugView = enum {
+    off,
+    /// Shading normal of the first surface hit, as (n+1)/2.
+    normals,
+    /// The same for the triangle's own normal. Held against `normals`, this
+    /// shows how far interpolation is bending the surface.
+    geometric_normals,
+    /// Red where a hit had the two normals disagreeing about which side the ray
+    /// came from, brightest where it happened on glass. This is the wrong-IOR
+    /// condition, and the one to look at first for speckled dielectrics.
+    normal_flip,
+    /// How many surfaces the path touched, black through blue to red, saturating
+    /// at `max_depth`.
+    bounces,
+    /// Red where the path hit the depth ceiling and returned black, green where
+    /// Russian roulette ended it, blue where it left the scene.
+    termination,
+    /// Material of the first surface hit: glass blue, metal yellow, matte grey,
+    /// emitters white. Confirms what the camera is actually looking at.
+    material,
+    /// Relative standard deviation of the samples in each pixel, heat-mapped.
+    /// This is the direct measure of speckle: an estimator whose samples
+    /// disagree wildly is exactly what salt-and-pepper noise looks like.
+    variance,
+    /// How much the brightest single sample outweighs the pixel's mean.
+    /// Red means one rare sample is carrying the pixel -- a firefly.
+    firefly,
+
+    fn parse(name: []const u8) ?DebugView {
+        inline for (@typeInfo(DebugView).@"enum".fields) |field| {
+            // Enum names use '_' where the command line reads better with '-'.
+            const cli_name = comptime blk: {
+                var buf: [field.name.len]u8 = undefined;
+                for (field.name, 0..) |c, i| buf[i] = if (c == '_') '-' else c;
+                const frozen = buf;
+                break :blk &frozen;
+            };
+            if (std.mem.eql(u8, name, cli_name)) return @field(DebugView, field.name);
+        }
+        return null;
+    }
+
+    /// Debug output is data, not a photograph: gamma would bend the numbers the
+    /// view exists to report.
+    fn wantsGamma(self: DebugView) bool {
+        return self == .off;
+    }
+
+    /// Whether the view describes the pixel's whole set of samples rather than
+    /// one path. Those cannot be averaged sample by sample like the others.
+    fn isPerPixel(self: DebugView) bool {
+        return switch (self) {
+            .variance, .firefly => true,
+            else => false,
+        };
+    }
+};
+
+fn normalToColor(n: Vec3) Color {
+    return mul(add(n, Vec3{ 1, 1, 1 }), 0.5);
+}
+
+/// Black -> blue -> cyan -> yellow -> red as `t` runs 0..1.
+fn heatColor(t: f64) Color {
+    const x = std.math.clamp(t, 0.0, 1.0);
+    return Color{
+        std.math.clamp(2.0 * x - 0.8, 0.0, 1.0),
+        std.math.clamp(1.4 * x, 0.0, 1.0) * std.math.clamp(2.0 - 2.0 * x, 0.0, 1.0) + std.math.clamp(3.0 * x - 2.0, 0.0, 1.0),
+        std.math.clamp(1.5 - 3.0 * x, 0.0, 1.0) * std.math.clamp(4.0 * x, 0.0, 1.0),
+    };
+}
+
+fn luminance(c: Color) f64 {
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+
+/// One sample of a per-path debug view, in the same units the ordinary renderer
+/// works in: the caller averages over samples and writes it out unchanged.
+fn debugColor(ctx: RenderContext, ray: Ray, rng: std.Random, view: DebugView) Color {
+    var stats = PathStats{};
+    const radiance = rayColorInner(ctx, ray, ctx.max_depth, rng, true, Color{ 1, 1, 1 }, &stats);
+
+    return switch (view) {
+        .off => radiance,
+
+        .normals => if (stats.first_hit) normalToColor(stats.first_normal) else Color{ 0, 0, 0 },
+        .geometric_normals => if (stats.first_hit) normalToColor(stats.first_geometric_normal) else Color{ 0, 0, 0 },
+
+        .normal_flip => blk: {
+            if (stats.dielectric_normal_flips > 0) break :blk Color{ 1, 0, 0 };
+            if (stats.normal_flips > 0) break :blk Color{ 0.35, 0.15, 0 };
+            break :blk if (stats.first_hit) Color{ 0.06, 0.06, 0.08 } else Color{ 0, 0, 0 };
+        },
+
+        .bounces => heatColor(@as(f64, @floatFromInt(stats.bounces)) / @as(f64, @floatFromInt(ctx.max_depth))),
+
+        .termination => blk: {
+            if (stats.exhausted) break :blk Color{ 1, 0, 0 };
+            if (stats.roulette_killed) break :blk Color{ 0, 1, 0 };
+            if (stats.escaped) break :blk Color{ 0, 0.1, 1 };
+            break :blk Color{ 0.1, 0.1, 0.1 };
+        },
+
+        .material => blk: {
+            if (!stats.first_hit) break :blk Color{ 0, 0, 0 };
+            break :blk switch (stats.first_material) {
+                .dielectric => Color{ 0.1, 0.4, 1.0 },
+                .metal => Color{ 1.0, 0.85, 0.1 },
+                .lambertian => Color{ 0.35, 0.35, 0.35 },
+                .diffuse_light => Color{ 1, 1, 1 },
+            };
+        },
+
+        // Handled a whole pixel at a time by renderPixel, which is the only
+        // place the samples exist together.
+        .variance, .firefly => unreachable,
+    };
+}
+
+/// Everything one pixel's samples said, for the views that ask about the
+/// estimator rather than about a path.
+const SampleSpread = struct {
+    count: u32 = 0,
+    sum: f64 = 0,
+    sum_squares: f64 = 0,
+    max: f64 = 0,
+
+    fn add(self: *SampleSpread, radiance: Color) void {
+        const l = @max(luminance(radiance), 0.0);
+        self.count += 1;
+        self.sum += l;
+        self.sum_squares += l * l;
+        self.max = @max(self.max, l);
+    }
+
+    fn mean(self: SampleSpread) f64 {
+        return if (self.count == 0) 0 else self.sum / @as(f64, @floatFromInt(self.count));
+    }
+
+    /// Standard deviation divided by the mean. Scale-free, so a dim pixel and a
+    /// bright one are judged by how much their samples disagree rather than by
+    /// how much light they carry.
+    fn relativeDeviation(self: SampleSpread) f64 {
+        const m = self.mean();
+        if (self.count == 0 or m <= 0) return 0;
+        const variance = @max(self.sum_squares / @as(f64, @floatFromInt(self.count)) - m * m, 0.0);
+        return @sqrt(variance) / m;
+    }
+
+    /// How far the brightest sample stands above the mean. One sample carrying
+    /// the pixel gives a ratio near the sample count.
+    fn peakRatio(self: SampleSpread) f64 {
+        const m = self.mean();
+        return if (m <= 0) 0 else self.max / m;
+    }
+};
+
+/// Render one pixel, in whichever view was asked for.
+///
+/// Returns the value already multiplied by `samples_per_pixel`, because the
+/// writer divides by it: the per-pixel views have no per-sample value to
+/// average, so they pre-multiply to come out the other side unchanged.
+fn renderPixel(
+    ctx: RenderContext,
+    camera: Camera,
+    x: u32,
+    y: u32,
+    samples_per_pixel: u32,
+    rng: std.Random,
+    view: DebugView,
+) Color {
+    const samples: f64 = @floatFromInt(samples_per_pixel);
+
+    if (view.isPerPixel()) {
+        var spread = SampleSpread{};
+        var sample: u32 = 0;
+        while (sample < samples_per_pixel) : (sample += 1) {
+            spread.add(rayColor(ctx, camera.getRay(x, y, rng), rng));
+        }
+
+        const value = switch (view) {
+            // Anything above 1.0 means the samples disagree by more than their
+            // own average, which is already hopeless; 2.0 keeps some headroom.
+            .variance => heatColor(spread.relativeDeviation() / 2.0),
+            // Scaled against the sample count: red means a single sample is
+            // supplying most of the pixel.
+            .firefly => heatColor(spread.peakRatio() / samples),
+            else => unreachable,
+        };
+        return mul(value, samples);
+    }
+
+    var accumulated = Color{ 0, 0, 0 };
+    var sample: u32 = 0;
+    while (sample < samples_per_pixel) : (sample += 1) {
+        const ray = camera.getRay(x, y, rng);
+        accumulated = add(accumulated, switch (view) {
+            .off => rayColor(ctx, ray, rng),
+            else => debugColor(ctx, ray, rng, view),
+        });
+    }
+    return accumulated;
+}
+
+/// Follow a few paths through one pixel and print each surface they touched.
+///
+/// The views show where a problem is; this shows what the renderer did there.
+/// It answers, for a single pixel, the questions the images can only hint at:
+/// whether a bright sample came from the lamp or from the floor, whether glass
+/// transmitted or reflected, and whether the shading normal was still pointing
+/// the same way as the surface underneath it.
+///
+/// Paths are printed in full up to `verbose_samples`, because a wall of them
+/// stops being readable; the rest are still traced, so the summary at the end
+/// describes the estimator rather than a sample of it. Any path far brighter
+/// than the pixel's mean is printed however late it turns up: those are the
+/// fireflies, and finding one is usually the point of probing at all.
+fn probePixel(
+    ctx: RenderContext,
+    camera: Camera,
+    x: u32,
+    y: u32,
+    samples: u32,
+    rng: std.Random,
+) void {
+    const verbose_samples = 12;
+    std.debug.print("\nProbing pixel ({d}, {d}) with {d} samples\n", .{ x, y, samples });
+
+    var spread = SampleSpread{};
+    var flipped_samples: u32 = 0;
+    var outliers: u32 = 0;
+
+    var sample: u32 = 0;
+    while (sample < samples) : (sample += 1) {
+        var trace = Trace{};
+        var stats = PathStats{ .trace = &trace };
+        const radiance = rayColorInner(ctx, camera.getRay(x, y, rng), ctx.max_depth, rng, true, Color{ 1, 1, 1 }, &stats);
+        if (stats.dielectric_normal_flips > 0) flipped_samples += 1;
+
+        const l = luminance(radiance);
+        // Compared against the mean of the samples before this one, so the test
+        // does not need a second pass or a threshold picked in advance.
+        const outlier = spread.count > 4 and l > 10.0 * spread.mean();
+        if (outlier) outliers += 1;
+        spread.add(radiance);
+
+        if (sample >= verbose_samples and !outlier) continue;
+
+        const ending = if (stats.exhausted)
+            "depth exhausted"
+        else if (stats.roulette_killed)
+            "roulette"
+        else if (stats.escaped)
+            "escaped to background"
+        else
+            "absorbed";
+
+        std.debug.print(
+            "  sample {d:>3}: L={d:>9.3}  bounces={d:>3}  {s}{s}\n",
+            .{ sample, l, stats.bounces, ending, if (outlier) "   *** FIREFLY ***" else "" },
+        );
+
+        for (trace.entries[0..trace.len], 0..) |e, i| {
+            const kind = if (!e.scattered)
+                "absorbed"
+            else if (e.material != .dielectric)
+                "scattered"
+            else if (e.transmitted)
+                "refracted"
+            else
+                "reflected";
+
+            // A flip means the shading normal and the triangle disagreed about
+            // which side the ray came from, so the dielectric branch above ran
+            // with the reciprocal of the index of refraction it needed.
+            const flag = if (e.front_face != e.geometric_front_face) "  <-- NORMAL FLIP" else "";
+
+            std.debug.print(
+                "      [{d:>2}] {s:<13} t={d:>8.4} {s:<9} entering={:<5} n.ng={d:>6.3}{s}\n",
+                .{ i, @tagName(e.material), e.t, kind, e.front_face, e.normal_agreement, flag },
+            );
+        }
+    }
+
+    std.debug.print(
+        "\n  mean L={d:.4}  max L={d:.4}  peak/mean={d:.1}x  relative deviation={d:.2}\n",
+        .{ spread.mean(), spread.max, spread.peakRatio(), spread.relativeDeviation() },
+    );
+    std.debug.print("  samples more than 10x the running mean: {d}/{d}\n", .{ outliers, samples });
+    std.debug.print("  samples with a normal flip on glass: {d}/{d}\n\n", .{ flipped_samples, samples });
 }
 
 // ============================================================================
@@ -3510,6 +4002,9 @@ const StageTimer = struct {
 
 const CliArgs = struct {
     scene: *const Scene,
+    debug_view: DebugView = .off,
+    /// Pixel to follow paths through instead of rendering, from `--probe=x,y`.
+    probe: ?[2]u32 = null,
 };
 
 /// Returns null when the program has already said everything it was asked to
@@ -3520,6 +4015,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !?CliArgs {
     _ = it.skip(); // program name
 
     var scene_name: []const u8 = default_scene_name;
+    var debug_view: DebugView = .off;
+    var probe: ?[2]u32 = null;
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -3528,6 +4025,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !?CliArgs {
         } else if (std.mem.eql(u8, arg, "--list-scenes")) {
             printScenes();
             return null;
+        } else if (std.mem.eql(u8, arg, "--list-debug-views")) {
+            printDebugViews();
+            return null;
         } else if (std.mem.startsWith(u8, arg, "--scene=")) {
             scene_name = arg["--scene=".len..];
         } else if (std.mem.eql(u8, arg, "--scene")) {
@@ -3535,6 +4035,36 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !?CliArgs {
                 std.debug.print("Error: --scene needs a scene name\n\n", .{});
                 printScenes();
                 return error.MissingSceneName;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--debug=") or std.mem.eql(u8, arg, "--debug")) {
+            const value = if (std.mem.startsWith(u8, arg, "--debug="))
+                arg["--debug=".len..]
+            else
+                it.next() orelse {
+                    std.debug.print("Error: --debug needs a view name\n\n", .{});
+                    printDebugViews();
+                    return error.MissingDebugView;
+                };
+            debug_view = DebugView.parse(value) orelse {
+                std.debug.print("Error: unknown debug view '{s}'\n\n", .{value});
+                printDebugViews();
+                return error.UnknownDebugView;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--probe=")) {
+            const value = arg["--probe=".len..];
+            const comma = std.mem.indexOfScalar(u8, value, ',') orelse {
+                std.debug.print("Error: --probe needs x,y\n", .{});
+                return error.InvalidProbe;
+            };
+            probe = .{
+                std.fmt.parseInt(u32, value[0..comma], 10) catch {
+                    std.debug.print("Error: --probe x must be a number\n", .{});
+                    return error.InvalidProbe;
+                },
+                std.fmt.parseInt(u32, value[comma + 1 ..], 10) catch {
+                    std.debug.print("Error: --probe y must be a number\n", .{});
+                    return error.InvalidProbe;
+                },
             };
         } else {
             std.debug.print("Error: unknown argument '{s}'\n\n", .{arg});
@@ -3551,7 +4081,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !?CliArgs {
         return error.UnknownScene;
     };
 
-    return CliArgs{ .scene = scene };
+    return CliArgs{ .scene = scene, .debug_view = debug_view, .probe = probe };
 }
 
 fn printUsage() void {
@@ -3561,15 +4091,34 @@ fn printUsage() void {
         \\Renders a scene to image.ppm.
         \\
         \\Options:
-        \\  --scene=<name>   Scene to render (default: {s})
-        \\  --list-scenes    List the available scenes and exit
-        \\  -h, --help       Show this help and exit
+        \\  --scene=<name>       Scene to render (default: {s})
+        \\  --list-scenes        List the available scenes and exit
+        \\  --debug=<view>       Render a diagnostic view instead of the image
+        \\  --list-debug-views   List the available diagnostic views and exit
+        \\  --probe=<x>,<y>      Print the paths through one pixel and exit
+        \\  -h, --help           Show this help and exit
         \\
         \\Image size, sample count, multithreading and the std.Io backend are
         \\build options; see the README for -Dwidth, -Dsamples, -Dmultithreading
         \\and -Dio.
         \\
     , .{default_scene_name});
+}
+
+fn printDebugViews() void {
+    std.debug.print(
+        \\Available debug views (--debug=<view>):
+        \\  off                Ordinary render (default)
+        \\  normals            Shading normal of the first surface hit
+        \\  geometric-normals  The triangle's own normal, for comparison
+        \\  normal-flip        Red where the two disagree on glass: wrong IOR
+        \\  bounces            Path length, black through blue to red
+        \\  termination        Red depth-exhausted, green roulette, blue escaped
+        \\  material           Glass blue, metal yellow, matte grey, lights white
+        \\  variance           Sample disagreement per pixel: where speckle is
+        \\  firefly            Where one rare bright sample carries the pixel
+        \\
+    , .{});
 }
 
 fn printScenes() void {
@@ -3584,7 +4133,7 @@ fn printScenes() void {
 // Color Utilities
 // ============================================================================
 
-fn writeColor(file: std.Io.File, io: std.Io, color: Color, samples_per_pixel: u32) !void {
+fn writeColor(file: std.Io.File, io: std.Io, color: Color, samples_per_pixel: u32, gamma: bool) !void {
     var r = color[0];
     var g = color[1];
     var b = color[2];
@@ -3596,9 +4145,11 @@ fn writeColor(file: std.Io.File, io: std.Io, color: Color, samples_per_pixel: u3
     b *= scale;
 
     // Apply gamma correction (gamma=2.0, so sqrt)
-    r = @sqrt(r);
-    g = @sqrt(g);
-    b = @sqrt(b);
+    if (gamma) {
+        r = @sqrt(r);
+        g = @sqrt(g);
+        b = @sqrt(b);
+    }
 
     // Convert to 0-255 range
     const ir = @as(u8, @intFromFloat(256.0 * std.math.clamp(r, 0.0, 0.999)));
@@ -3710,6 +4261,7 @@ const WorkerContext = struct {
     samples_per_pixel: u32,
     thread_id: u32,
     progress: *Progress,
+    debug_view: DebugView = .off,
 };
 
 fn generateTiles(allocator: std.mem.Allocator, width: u32, height: u32, tile_size: u32) ![]Tile {
@@ -3745,14 +4297,15 @@ fn workerThread(ctx: *WorkerContext) void {
         while (y < tile.end_y) : (y += 1) {
             var x = tile.start_x;
             while (x < tile.end_x) : (x += 1) {
-                var pixel_color = Color{ 0, 0, 0 };
-
-                // Multiple samples per pixel
-                var sample: u32 = 0;
-                while (sample < ctx.samples_per_pixel) : (sample += 1) {
-                    const ray = ctx.camera.getRay(x, y, rng);
-                    pixel_color = add(pixel_color, rayColor(ctx.render, ray, rng));
-                }
+                const pixel_color = renderPixel(
+                    ctx.render,
+                    ctx.camera.*,
+                    x,
+                    y,
+                    ctx.samples_per_pixel,
+                    rng,
+                    ctx.debug_view,
+                );
 
                 // Write to shared buffer (no race condition - each thread writes different tiles)
                 ctx.pixel_buffer.set(x, y, pixel_color);
@@ -3865,6 +4418,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
 
+    if (args.probe) |p| {
+        // A probe answers a question about a handful of paths, so it prints and
+        // stops rather than leaving a half-written image behind.
+        var probe_prng = std.Random.DefaultPrng.init(42);
+        probePixel(render_ctx, camera, p[0], p[1], samples_per_pixel, probe_prng.random());
+        return;
+    }
+
     // Configuration (build-time constants from build.zig)
     const use_multithreading = build_options.use_multithreading; // Set via -Dmultithreading=true/false
     const tile_size: u32 = 32; // 32x32 pixel tiles (only used if multithreading)
@@ -3913,6 +4474,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .samples_per_pixel = samples_per_pixel,
                 .thread_id = @intCast(i),
                 .progress = &progress,
+                .debug_view = args.debug_view,
             };
 
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{&contexts[i]});
@@ -3932,7 +4494,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var x: u32 = 0;
             while (x < camera.image_width) : (x += 1) {
                 const color = pixel_buffer.get(x, y);
-                try writeColor(file, io, color, samples_per_pixel);
+                try writeColor(file, io, color, samples_per_pixel, args.debug_view.wantsGamma());
             }
         }
     } else {
@@ -3950,16 +4512,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             var i: u32 = 0;
             while (i < camera.image_width) : (i += 1) {
-                var pixel_color = Color{ 0, 0, 0 };
-
-                // Take multiple samples per pixel
-                var sample: u32 = 0;
-                while (sample < samples_per_pixel) : (sample += 1) {
-                    const ray = camera.getRay(i, j, rng);
-                    pixel_color = add(pixel_color, rayColor(render_ctx, ray, rng));
-                }
-
-                try writeColor(file, io, pixel_color, samples_per_pixel);
+                const pixel_color = renderPixel(render_ctx, camera, i, j, samples_per_pixel, rng, args.debug_view);
+                try writeColor(file, io, pixel_color, samples_per_pixel, args.debug_view.wantsGamma());
             }
         }
     }
@@ -4215,9 +4769,11 @@ test "a light emits from one face and scatters nothing" {
     const rec = HitRecord{
         .point = Point3{ 0, 0, 0 },
         .normal = Vec3{ 0, 1, 0 },
+        .geometric_normal = Vec3{ 0, 1, 0 },
         .material = material,
         .t = 1.0,
         .front_face = true,
+        .geometric_front_face = true,
     };
     try std.testing.expect(!material.scatter(
         Ray.init(Point3{ 0, 1, 0 }, Vec3{ 0, -1, 0 }),
@@ -4226,6 +4782,86 @@ test "a light emits from one face and scatters nothing" {
         &scattered,
         prng.random(),
     ));
+}
+
+test "glass takes its side from the surface, not from an interpolated normal" {
+    // Wound so the triangle's own normal points up, and given vertex normals
+    // tilted far below its own plane -- the situation smooth shading creates at
+    // a silhouette on a scanned mesh, exaggerated until it is unambiguous.
+    const tilted = unitVector(Vec3{ 0.8, -0.6, 0 });
+    const glass = Material.dielectric(1.5);
+    const triangle = Triangle.initWithNormals(
+        Point3{ -1, 0, -1 },
+        Point3{ -1, 0, 1 },
+        Point3{ 1, 0, -1 },
+        tilted,
+        tilted,
+        tilted,
+        glass,
+    );
+
+    // Straight down, so the ray meets the real surface square on. Whatever the
+    // shading normal claims, light arriving perpendicular to a sheet of glass
+    // goes through it very nearly undeviated.
+    const ray = Ray.init(Point3{ -0.4, 1, -0.4 }, Vec3{ 0, -1, 0 });
+    var rec: HitRecord = undefined;
+    try std.testing.expect(triangle.hit(ray, Interval{ .min = 0.001, .max = 100 }, &rec));
+
+    // The setup is only interesting if the two normals really do disagree: the
+    // ray is entering the glass, and the shading normal denies it.
+    try std.testing.expect(rec.geometric_front_face);
+    try std.testing.expect(!rec.front_face);
+
+    // Believing the shading normal here refracts with 1.5 instead of 1/1.5,
+    // which puts sin(theta) past the critical angle and reflects every ray. The
+    // reflection is about a normal tilted 53 degrees off the surface, so it does
+    // not even bounce back: it sets off at a grazing 74 degrees from straight
+    // through, skimming into the glass it was supposed to bounce off.
+    var prng = std.Random.DefaultPrng.init(7);
+    const rng = prng.random();
+
+    const straight_through = neg(rec.geometric_normal);
+    var passed_through: u32 = 0;
+    const trials = 200;
+    for (0..trials) |_| {
+        var scattered: Ray = undefined;
+        var attenuation: Color = undefined;
+        try std.testing.expect(glass.scatter(ray, rec, &attenuation, &scattered, rng));
+
+        // Within 45 degrees of undeviated. The wrong-normal answer sits at 74
+        // degrees, so there is no overlap to argue about.
+        if (dot(unitVector(scattered.direction), straight_through) > 0.7) passed_through += 1;
+    }
+
+    try std.testing.expect(passed_through > trials * 9 / 10);
+}
+
+test "bendRay reports transmission that matches the side it sent the ray to" {
+    // The fallback in the dielectric branch rests on this: it compares
+    // `transmitted` against the side of the geometric surface the direction
+    // landed on, and that comparison only means anything if the two agree when
+    // the normal is honest.
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+
+    const n = Vec3{ 0, 1, 0 };
+    for ([_]f64{ 1.0 / 1.5, 1.5, 1.0 / 2.4, 2.4 }) |ri| {
+        for (0..64) |i| {
+            // Sweep from near-perpendicular to grazing, which is where total
+            // internal reflection takes over.
+            const slant = 0.02 + 3.0 * (@as(f64, @floatFromInt(i)) / 63.0);
+            const incoming = unitVector(Vec3{ slant, -1, slant * 0.4 });
+
+            const bent = bendRay(incoming, n, ri, rng);
+            const side = dot(bent.direction, n);
+
+            if (bent.transmitted) {
+                try std.testing.expect(side < 0);
+            } else {
+                try std.testing.expect(side > 0);
+            }
+        }
+    }
 }
 
 test "an area light is sampled from its front face and through nothing solid" {
@@ -4317,13 +4953,13 @@ test "emission stops being counted once a path has touched a diffuse surface" {
 
     // Straight from the camera: the lamp's reflection is visible, and nothing
     // else accounts for it.
-    const seen = rayColorInner(with_map, down, 8, rng, true, Color{ 1, 1, 1 });
+    const seen = rayColorInner(with_map, down, 8, rng, true, Color{ 1, 1, 1 }, null);
     try std.testing.expectApproxEqAbs(6.0, seen[0], 1e-9);
 
     // The same path, but reached after a diffuse bounce. Direct sampling
     // covered the lamp at that surface and the caustic map covers it arriving
     // via the mirror, so counting it here would be the third time.
-    const already_accounted = rayColorInner(with_map, down, 8, rng, false, Color{ 1, 1, 1 });
+    const already_accounted = rayColorInner(with_map, down, 8, rng, false, Color{ 1, 1, 1 }, null);
     try std.testing.expectEqual(Color{ 0, 0, 0 }, already_accounted);
 
     // Without a caustic map nothing else covers specular paths, so the
@@ -4334,7 +4970,7 @@ test "emission stops being counted once a path has touched a diffuse surface" {
         .photon_map = null,
         .max_depth = 8,
     };
-    const counted = rayColorInner(path_traced, down, 8, rng, false, Color{ 1, 1, 1 });
+    const counted = rayColorInner(path_traced, down, 8, rng, false, Color{ 1, 1, 1 }, null);
     try std.testing.expectApproxEqAbs(6.0, counted[0], 1e-9);
 }
 

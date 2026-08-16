@@ -226,6 +226,70 @@ Rendering and viewing are deliberately separate: the raytracer only ever writes
 a `.ppm`, and `png`/`view` only act on a `.ppm` that already exists. Conversion
 is a normal make rule, so re-viewing an unchanged render does not reconvert it.
 
+## Diagnostics
+
+Rendering bugs rarely announce themselves. A dielectric that has gone wrong
+looks like a dielectric that is merely under-sampled, and both look like a
+model that was exported badly. `--debug` and `--probe` exist to tell those
+apart without changing the renderer to ask.
+
+`--debug=<view>` renders a false-colour image in place of the photograph. The
+views are traced by the ordinary renderer with a recorder attached, not by a
+separate simplified one, so what they report is what the render did.
+
+```sh
+./zig-out/bin/zaytracer --scene=glass-dragon --debug=variance
+./zig-out/bin/zaytracer --list-debug-views
+```
+
+| View | Question it answers |
+| --- | --- |
+| `normals` | What is the shading normal of the first surface seen? |
+| `geometric-normals` | What normal does that triangle actually have? |
+| `normal-flip` | Where do the two disagree about which side a ray arrived on? Red is glass, where it inverts the index of refraction. |
+| `bounces` | How long are the paths? Black through blue to red. |
+| `termination` | How do paths end? Red hit the depth ceiling, green was Russian roulette, blue left the scene. |
+| `material` | What is the camera actually looking at? Glass blue, metal yellow, matte grey, emitters white. |
+| `variance` | Where do a pixel's samples disagree with each other? This is where speckle is. |
+| `firefly` | Where is one rare bright sample carrying a whole pixel? |
+
+`variance` is usually the one to reach for first: speckle *is* sample
+disagreement, so it separates a noisy estimator from a surface that is
+genuinely detailed. `material` settles arguments about geometry — a shape that
+looks like the wrong material is often the right one, shaded oddly.
+
+Debug views are written without gamma, because they are measurements rather
+than pictures.
+
+`--probe=<x>,<y>` stops before rendering and prints the paths through a single
+pixel: every surface each one touched, whether glass transmitted or reflected,
+how far the shading normal had been bent from the surface, and how the path
+ended. Paths far brighter than the pixel's running mean are flagged and printed
+however late they occur, since finding a firefly is usually the point.
+
+```sh
+zig build run -Doptimize=ReleaseFast -Dwidth=600 -Dsamples=512 -- \
+  --scene=glass-dragon --probe=320,165
+```
+
+```
+sample 419: L=   32.490  bounces= 10  absorbed   *** FIREFLY ***
+    [ 0] dielectric    t=  0.9883 refracted entering=true  n.ng= 0.993
+    [ 1] dielectric    t=  1.4053 reflected entering=false n.ng= 1.000
+    ...
+mean L=0.2520  max L=32.4903  peak/mean=128.9x  relative deviation=5.76
+```
+
+`n.ng` is the cosine between the shading normal and the triangle's own normal:
+`1.000` is a flat-shaded hit, and anything much below it means light is being
+bent about a normal the surface does not have. The sample count comes from
+`-Dsamples`; full traces stop after the first twelve so the output stays
+readable.
+
+`tools/ppm_inspect.py` measures the resulting images — crops regions, converts
+to PNG, and reports neighbour-to-neighbour noise, which puts a number on how
+speckled a region is. See `tools/README.md`.
+
 ## Implementation Notes
 
 - Uses full Zig idioms (error handling, tagged unions, comptime)
