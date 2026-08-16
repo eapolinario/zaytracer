@@ -2072,11 +2072,29 @@ const RenderContext = struct {
     background: Background = .sky,
     photon_map: ?*const PhotonMap = null,
     lights: []const Light = &.{},
+    /// Hard ceiling on path length. Russian roulette ends nearly every path
+    /// long before this, but a path through glass can keep total internal
+    /// reflection going indefinitely, so the ceiling stays.
+    max_depth: i32 = 50,
 };
 
-fn rayColor(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random) Color {
-    // A camera ray sees emitters directly: nothing has sampled them yet.
-    return rayColorInner(ctx, ray, depth, rng, true);
+/// Bounces taken before Russian roulette is allowed to end a path. The first
+/// few carry most of the light, and killing them is visible as noise exactly
+/// where it is least welcome.
+const roulette_min_bounces: i32 = 4;
+
+/// Ceiling on the survival probability, so that even a path losing nothing --
+/// glass, which absorbs none of it -- still has a way out.
+const roulette_max_survival: f64 = 0.95;
+
+fn rayColor(ctx: RenderContext, ray: Ray, rng: std.Random) Color {
+    // A camera ray sees emitters directly: nothing has sampled them yet, and
+    // it has lost nothing on the way in.
+    //
+    // The depth budget comes from the context rather than the caller: roulette
+    // works out how deep a path is by subtracting what is left from it, and a
+    // caller passing a different number would silently misjudge that.
+    return rayColorInner(ctx, ray, ctx.max_depth, rng, true, Color{ 1, 1, 1 });
 }
 
 /// `count_emission` says whether hitting a light should add its emission.
@@ -2093,7 +2111,7 @@ fn rayColor(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random) Color {
 /// the camera: looking at the lamp, or at its reflection, or at it through
 /// glass. Without a photon map nothing else covers specular paths, so there
 /// they are counted and the renderer degrades to plain path tracing.
-fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, count_emission: bool) Color {
+fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, count_emission: bool, throughput: Color) Color {
     // If we've exceeded the ray bounce limit, no more light is gathered
     if (depth <= 0) {
         return Color{ 0, 0, 0 };
@@ -2147,8 +2165,24 @@ fn rayColorInner(ctx: RenderContext, ray: Ray, depth: i32, rng: std.Random, coun
             else
                 count_emission;
 
-            const indirect = rayColorInner(ctx, scattered, depth - 1, rng, bounce_counts_emission);
-            return add(local, mulVec(attenuation, indirect));
+            // Russian roulette. A path that has already given up most of its
+            // energy contributes almost nothing however far it goes, but costs
+            // the same as one that has just left the camera. Ending it early
+            // and dividing the survivors by the odds of surviving leaves the
+            // average untouched.
+            var carried = mulVec(throughput, attenuation);
+            var compensated = attenuation;
+
+            if (ctx.max_depth - depth >= roulette_min_bounces) {
+                const survival = @min(@max(@max(carried[0], carried[1]), carried[2]), roulette_max_survival);
+                if (randomFloat(rng) >= survival) return local;
+
+                compensated = div(attenuation, survival);
+                carried = div(carried, survival);
+            }
+
+            const indirect = rayColorInner(ctx, scattered, depth - 1, rng, bounce_counts_emission, carried);
+            return add(local, mulVec(compensated, indirect));
         }
         return local;
     }
@@ -3025,7 +3059,6 @@ const WorkerContext = struct {
     camera: *const Camera,
     render: RenderContext,
     samples_per_pixel: u32,
-    max_depth: i32,
     thread_id: u32,
     progress: *Progress,
 };
@@ -3069,7 +3102,7 @@ fn workerThread(ctx: *WorkerContext) void {
                 var sample: u32 = 0;
                 while (sample < ctx.samples_per_pixel) : (sample += 1) {
                     const ray = ctx.camera.getRay(x, y, rng);
-                    pixel_color = add(pixel_color, rayColor(ctx.render, ray, ctx.max_depth, rng));
+                    pixel_color = add(pixel_color, rayColor(ctx.render, ray, rng));
                 }
 
                 // Write to shared buffer (no race condition - each thread writes different tiles)
@@ -3171,15 +3204,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Final: -Dwidth=1200 -Dsamples=500 (slow, ~minutes to hours)
     const camera = scene.camera.toCamera(build_options.image_width);
 
+    const max_depth: i32 = 50;
+
     const render_ctx = RenderContext{
         .world = world,
         .background = scene.background,
         .photon_map = &photon_map,
         .lights = scene.lights.items,
+        .max_depth = max_depth,
     };
 
     const samples_per_pixel: u32 = build_options.samples_per_pixel; // Configurable via -Dsamples=N
-    const max_depth: i32 = 50;
 
     // Configuration (build-time constants from build.zig)
     const use_multithreading = build_options.use_multithreading; // Set via -Dmultithreading=true/false
@@ -3227,7 +3262,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .camera = &camera,
                 .render = render_ctx,
                 .samples_per_pixel = samples_per_pixel,
-                .max_depth = max_depth,
                 .thread_id = @intCast(i),
                 .progress = &progress,
             };
@@ -3273,7 +3307,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 var sample: u32 = 0;
                 while (sample < samples_per_pixel) : (sample += 1) {
                     const ray = camera.getRay(i, j, rng);
-                    pixel_color = add(pixel_color, rayColor(render_ctx, ray, max_depth, rng));
+                    pixel_color = add(pixel_color, rayColor(render_ctx, ray, rng));
                 }
 
                 try writeColor(file, io, pixel_color, samples_per_pixel);
@@ -3627,17 +3661,20 @@ test "emission stops being counted once a path has touched a diffuse surface" {
         .world = world,
         .background = .{ .solid = Color{ 0, 0, 0 } },
         .photon_map = &map,
+        // Matches the depth passed below, so the roulette sees a path two
+        // bounces old rather than one that has been going for forty.
+        .max_depth = 8,
     };
 
     // Straight from the camera: the lamp's reflection is visible, and nothing
     // else accounts for it.
-    const seen = rayColorInner(with_map, down, 8, rng, true);
+    const seen = rayColorInner(with_map, down, 8, rng, true, Color{ 1, 1, 1 });
     try std.testing.expectApproxEqAbs(6.0, seen[0], 1e-9);
 
     // The same path, but reached after a diffuse bounce. Direct sampling
     // covered the lamp at that surface and the caustic map covers it arriving
     // via the mirror, so counting it here would be the third time.
-    const already_accounted = rayColorInner(with_map, down, 8, rng, false);
+    const already_accounted = rayColorInner(with_map, down, 8, rng, false, Color{ 1, 1, 1 });
     try std.testing.expectEqual(Color{ 0, 0, 0 }, already_accounted);
 
     // Without a caustic map nothing else covers specular paths, so the
@@ -3646,8 +3683,9 @@ test "emission stops being counted once a path has touched a diffuse surface" {
         .world = world,
         .background = .{ .solid = Color{ 0, 0, 0 } },
         .photon_map = null,
+        .max_depth = 8,
     };
-    const counted = rayColorInner(path_traced, down, 8, rng, false);
+    const counted = rayColorInner(path_traced, down, 8, rng, false, Color{ 1, 1, 1 });
     try std.testing.expectApproxEqAbs(6.0, counted[0], 1e-9);
 }
 
