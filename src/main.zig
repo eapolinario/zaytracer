@@ -100,14 +100,6 @@ fn randomFloatRange(rng: std.Random, min: f64, max: f64) f64 {
     return min + (max - min) * randomFloat(rng);
 }
 
-fn randomVec3(rng: std.Random) Vec3 {
-    return Vec3{
-        randomFloat(rng),
-        randomFloat(rng),
-        randomFloat(rng),
-    };
-}
-
 fn randomVec3Range(rng: std.Random, min: f64, max: f64) Vec3 {
     return Vec3{
         randomFloatRange(rng, min, max),
@@ -550,7 +542,6 @@ const Interval = struct {
     }
 
     pub const empty = Interval{ .min = std.math.inf(f64), .max = -std.math.inf(f64) };
-    pub const universe = Interval{ .min = -std.math.inf(f64), .max = std.math.inf(f64) };
 };
 
 // ============================================================================
@@ -737,7 +728,6 @@ const Triangle = struct {
 
     // Material
     material: Material,
-    material_index: u32, // Future: per-face materials (currently unused, set to 0)
 
     // Precomputed edges (performance optimization)
     edge1: Vec3, // v1 - v0
@@ -758,7 +748,6 @@ const Triangle = struct {
             .n2 = flat_normal,
             .has_normals = false,
             .material = material,
-            .material_index = 0,
             .edge1 = edge1,
             .edge2 = edge2,
         };
@@ -783,7 +772,6 @@ const Triangle = struct {
             .n2 = unitVector(n2),
             .has_normals = true,
             .material = material,
-            .material_index = 0,
             .edge1 = sub(v1, v0),
             .edge2 = sub(v2, v0),
         };
@@ -901,34 +889,6 @@ const Primitive = union(enum) {
             .sphere => |s| s.hit(ray, ray_t, rec),
             .triangle => |t| t.hit(ray, ray_t, rec),
         };
-    }
-};
-
-// ============================================================================
-// Hittable List
-// ============================================================================
-
-const HittableList = struct {
-    spheres: []const Sphere,
-
-    pub fn init(spheres: []const Sphere) HittableList {
-        return HittableList{ .spheres = spheres };
-    }
-
-    pub fn hit(self: HittableList, ray: Ray, ray_t: Interval, rec: *HitRecord) bool {
-        var temp_rec: HitRecord = undefined;
-        var hit_anything = false;
-        var closest_so_far = ray_t.max;
-
-        for (self.spheres) |sphere| {
-            if (sphere.hit(ray, Interval{ .min = ray_t.min, .max = closest_so_far }, &temp_rec)) {
-                hit_anything = true;
-                closest_so_far = temp_rec.t;
-                rec.* = temp_rec;
-            }
-        }
-
-        return hit_anything;
     }
 };
 
