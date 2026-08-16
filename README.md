@@ -246,6 +246,18 @@ There are two ways light reaches the camera, and they must not overlap:
   the gap above itself across almost no distance, and direct sampling divides
   by the square of that distance.
 
+Paths end by Russian roulette rather than by running out of depth. After four
+bounces a path survives with a probability equal to how much of its energy it
+still carries, and survivors are divided by that probability, which leaves the
+average untouched while cutting the work. It matters most where paths never
+escape: the closed Cornell box renders in half the time, and a converged render
+of it agrees with the old one to within 0.2% in every region, which is the
+difference between an unbiased shortcut and simply rendering less.
+
+The depth limit remains as a ceiling, since a ray inside glass can keep
+reflecting internally, and roulette caps the survival probability below 1 so
+that even a path losing nothing has a way out.
+
 Emission is counted only while a path has been specular the whole way from the
 camera: looking at the lamp, at its reflection, or at it through glass. Once a
 path touches a diffuse surface, direct sampling has covered that light and the
@@ -301,18 +313,18 @@ Stage timings at 500x281 and 80 samples on 16 threads, which is what the
 
 | Scene | Primitives | Scene build | BVH build | Caustics | Render |
 | --- | --- | --- | --- | --- | --- |
-| `cover` | 6,817 | 3.7ms | 21.0ms | 705.9ms | 3.7s |
-| `spot` | 5,859 | 3.9ms | 29.6ms | 756.0ms | 7.7s |
-| `cornell-box` | 20 | 42.9us | 21.0us | 447.0ms | 3m15s |
-| `glass-bunny` | 69,455 | 33.1ms | 771.9ms | 9.3s | 45.6s |
-| `glass-dragon` | 249,886 | 175.9ms | 3.6s | 12.6s | 13.7s |
+| `cover` | 6,817 | 3.7ms | 21.0ms | 705.9ms | 2.9s |
+| `spot` | 5,859 | 3.9ms | 29.6ms | 756.0ms | 6.8s |
+| `cornell-box` | 20 | 42.9us | 21.0us | 447.0ms | 1m14s |
+| `glass-bunny` | 69,455 | 33.1ms | 771.9ms | 9.3s | 35.7s |
+| `glass-dragon` | 249,886 | 175.9ms | 3.6s | 12.6s | 10.2s |
 
 Parsing 11.3 MB of OBJ and generating smooth normals for a quarter of a million
 triangles costs 176ms, which is nothing. The BVH build is the one to watch:
 3.6s, single-threaded, and the reason the dragon takes longer to set up than to
-render. The closed Cornell box is the surprise — 20 primitives and by far the
-slowest render, because no path ever escapes it and every one runs the full 50
-bounces.
+render. The closed Cornell box is still the slowest render off just 20
+primitives, because no path escapes it, though Russian roulette has roughly
+halved what that costs.
 
 Triangle count is not what makes a render slow, though. The bunny has a quarter
 of the dragon's triangles and takes three times as long, because what costs is
