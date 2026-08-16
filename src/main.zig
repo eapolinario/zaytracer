@@ -1661,6 +1661,13 @@ fn parseOBJ(allocator: std.mem.Allocator, io: std.Io, filepath: []const u8) !OBJ
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, filepath, allocator, .limited(max_file_size));
     defer allocator.free(contents);
 
+    return parseOBJText(allocator, contents);
+}
+
+/// The parser proper, split from reading the file so it can be tested against
+/// text held in memory. Tests that need a file on disk cannot run in CI, which
+/// never fetches a model, and would say more about the fixture than the parser.
+fn parseOBJText(allocator: std.mem.Allocator, contents: []const u8) !OBJData {
     // Dynamic arrays for parsed data
     var vertices = try std.ArrayList(Vec3).initCapacity(allocator, 100);
     defer vertices.deinit(allocator);
@@ -3716,4 +3723,204 @@ test "a fitted mesh lands where it was asked to" {
     // Sitting it on the floor must not have resized or slid it sideways.
     try std.testing.expectApproxEqAbs(5.0, box.x.size(), 1e-9);
     try std.testing.expectApproxEqAbs(1.0, (box.x.min + box.x.max) / 2.0, 1e-9);
+}
+
+// ============================================================================
+// Tests - OBJ Parsing
+// ============================================================================
+
+test "obj faces carry positions, and indices come back zero-based" {
+    const source =
+        \\# a comment, and the blank line below is not an error
+        \\
+        \\v 1.0 2.0 3.0
+        \\v 4.0 5.0 6.0
+        \\v 7.0 8.0 9.0
+        \\f 1 2 3
+    ;
+
+    const data = try parseOBJText(std.testing.allocator, source);
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), data.vertices.len);
+    try std.testing.expectEqual(Vec3{ 1.0, 2.0, 3.0 }, data.vertices[0]);
+    try std.testing.expectEqual(Vec3{ 7.0, 8.0, 9.0 }, data.vertices[2]);
+
+    try std.testing.expectEqual(@as(usize, 1), data.faces.len);
+
+    // OBJ counts from 1 and we count from 0. An off-by-one here would still
+    // render, just as the wrong triangle.
+    try std.testing.expectEqual(@as(u32, 0), data.faces[0].v0);
+    try std.testing.expectEqual(@as(u32, 1), data.faces[0].v1);
+    try std.testing.expectEqual(@as(u32, 2), data.faces[0].v2);
+    try std.testing.expect(!data.faces[0].hasNormals());
+}
+
+test "obj face formats all resolve to the same triangle" {
+    // v, v/vt, v//vn and v/vt/vn. Spot is the v/vt one; the teapot and the
+    // dragon are plain v; models with normals use the other two.
+    const cases = [_][]const u8{
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\vn 0 0 1
+        \\f 1 2 3
+        ,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\vn 0 0 1
+        \\vt 0.5 0.5
+        \\f 1/1 2/1 3/1
+        ,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\vn 0 0 1
+        \\f 1//1 2//1 3//1
+        ,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\vn 0 0 1
+        \\vt 0.5 0.5
+        \\f 1/1/1 2/1/1 3/1/1
+        ,
+    };
+    // Only the last two name a normal.
+    const expect_normals = [_]bool{ false, false, true, true };
+
+    for (cases, expect_normals) |source, wants_normals| {
+        const data = try parseOBJText(std.testing.allocator, source);
+        defer data.deinit();
+
+        try std.testing.expectEqual(@as(usize, 3), data.vertices.len);
+        try std.testing.expectEqual(@as(usize, 1), data.normals.len);
+        try std.testing.expectEqual(@as(usize, 1), data.faces.len);
+
+        const face = data.faces[0];
+        try std.testing.expectEqual(@as(u32, 0), face.v0);
+        try std.testing.expectEqual(@as(u32, 1), face.v1);
+        try std.testing.expectEqual(@as(u32, 2), face.v2);
+
+        try std.testing.expectEqual(wants_normals, face.hasNormals());
+        if (wants_normals) {
+            try std.testing.expectEqual(@as(u32, 0), face.n0);
+            try std.testing.expectEqual(@as(u32, 0), face.n2);
+        }
+    }
+}
+
+test "obj polygons are fanned into triangles from the first vertex" {
+    const source =
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 2 0 0
+        \\v 3 0 0
+        \\v 4 0 0
+        \\f 1 2 3 4 5
+    ;
+
+    const data = try parseOBJText(std.testing.allocator, source);
+    defer data.deinit();
+
+    // A fan over n vertices is n - 2 triangles, every one of them hinged on the
+    // first: (0,1,2), (0,2,3), (0,3,4).
+    try std.testing.expectEqual(@as(usize, 3), data.faces.len);
+    for (data.faces, 0..) |face, i| {
+        try std.testing.expectEqual(@as(u32, 0), face.v0);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), face.v1);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 2)), face.v2);
+    }
+}
+
+test "obj lines the parser does not handle are skipped, not misread" {
+    const source =
+        "mtllib scene.mtl\r\n" ++
+        "o some_object\r\n" ++
+        "g some_group\r\n" ++
+        "usemtl red\r\n" ++
+        "s off\r\n" ++
+        "vt 0.25 0.75\r\n" ++
+        "v 1 2 3\r\n" ++
+        "v 4 5 6\r\n" ++
+        "v 7 8 9\r\n" ++
+        "vn 0 1 0\r\n" ++
+        "f 1 2 3\r\n";
+
+    const data = try parseOBJText(std.testing.allocator, source);
+    defer data.deinit();
+
+    // vt must not be mistaken for a vertex, and CRLF must not leave a stray
+    // carriage return inside the last number on every line.
+    try std.testing.expectEqual(@as(usize, 3), data.vertices.len);
+    try std.testing.expectEqual(Vec3{ 7, 8, 9 }, data.vertices[2]);
+    try std.testing.expectEqual(@as(usize, 1), data.normals.len);
+    try std.testing.expectEqual(Vec3{ 0, 1, 0 }, data.normals[0]);
+    try std.testing.expectEqual(@as(usize, 1), data.faces.len);
+}
+
+test "obj vertices may carry a fourth component, which is ignored" {
+    const source =
+        \\v 1 2 3 1.0
+        \\v 4 5 6 0.5
+        \\v 7 8 9 1.0
+        \\f 1 2 3
+    ;
+
+    const data = try parseOBJText(std.testing.allocator, source);
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), data.vertices.len);
+    try std.testing.expectEqual(Vec3{ 4, 5, 6 }, data.vertices[1]);
+}
+
+test "obj input the parser cannot honour is rejected rather than guessed at" {
+    const allocator = std.testing.allocator;
+
+    // Negative indices are legal OBJ, meaning "count back from the end", and
+    // this parser does not implement them. Rejecting is right; quietly reading
+    // them as positive would place the triangle somewhere else entirely.
+    try std.testing.expectError(error.InvalidIndex, parseOBJText(allocator,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\v 0 1 0
+        \\f -3 -2 -1
+    ));
+
+    // Index 0 does not exist in a format that counts from 1.
+    try std.testing.expectError(error.InvalidIndex, parseOBJText(allocator,
+        \\v 0 0 0
+        \\f 0 0 0
+    ));
+
+    // A face needs three corners.
+    try std.testing.expectError(error.InvalidFormat, parseOBJText(allocator,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\f 1 2
+    ));
+
+    // A position needs three components.
+    try std.testing.expectError(error.InvalidFormat, parseOBJText(allocator,
+        \\v 1 2
+    ));
+
+    // And a number has to be one.
+    try std.testing.expectError(error.InvalidCharacter, parseOBJText(allocator,
+        \\v 1 2 three
+    ));
+}
+
+test "an obj with no faces yields an empty mesh rather than an error" {
+    // A point cloud is not something to render, but it is not malformed, and
+    // the loader should not fall over on it.
+    const data = try parseOBJText(std.testing.allocator,
+        \\v 0 0 0
+        \\v 1 0 0
+    );
+    defer data.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 0), data.faces.len);
 }
