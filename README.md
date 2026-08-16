@@ -112,6 +112,12 @@ scene pointing at something nobody can fetch fails the build rather than the
 render. The manifest is embedded at compile time for this, which is why
 `build.zig` hands it to the test module.
 
+The OBJ loader takes positions, normals and faces, in any of the `v`, `v/vt`,
+`v//vn` and `v/vt/vn` forms, with indices counted from 1 or counted back from
+the end. Polygons are fanned into triangles. It ignores `vt`, `mtllib`,
+`usemtl`, `o`, `g` and `s`, so a model with per-face materials loads as a single
+one, and it does not read PLY.
+
 Note that this sha256 is of the file itself, which is **not** the SHA the
 GitHub API reports for a blob — that one is `sha1("blob <len>\0" + content)`.
 Comparing against the wrong one fails every time.

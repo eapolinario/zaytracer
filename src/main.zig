@@ -1687,7 +1687,9 @@ fn parseOBJText(allocator: std.mem.Allocator, contents: []const u8) !OBJData {
         } else if (std.mem.startsWith(u8, trimmed, "vn ")) {
             try parseNormal(&normals, trimmed, allocator);
         } else if (std.mem.startsWith(u8, trimmed, "f ")) {
-            try parseFace(&faces, trimmed, allocator);
+            // Counts as they stand at this line, because a negative index
+            // counts back from here rather than from the end of the file.
+            try parseFace(&faces, trimmed, allocator, vertices.items.len, normals.items.len);
         }
         // Ignore: vt (textures), mtllib, usemtl, s, o, g
     }
@@ -1732,7 +1734,13 @@ fn parseNormal(normals: *std.ArrayList(Vec3), line: []const u8, allocator: std.m
     try normals.append(allocator, Vec3{ x, y, z });
 }
 
-fn parseFace(faces: *std.ArrayList(Face), line: []const u8, allocator: std.mem.Allocator) !void {
+fn parseFace(
+    faces: *std.ArrayList(Face),
+    line: []const u8,
+    allocator: std.mem.Allocator,
+    vertices_so_far: usize,
+    normals_so_far: usize,
+) !void {
     // Parse face: "f v1/vt1/vn1 v2/vt2/vn2 v3/vt3/vn3" (or variations)
     var iter = std.mem.tokenizeAny(u8, line, " \t");
     _ = iter.next(); // skip "f"
@@ -1741,9 +1749,9 @@ fn parseFace(faces: *std.ArrayList(Face), line: []const u8, allocator: std.mem.A
     const vert2 = iter.next() orelse return error.InvalidFormat;
     const vert3 = iter.next() orelse return error.InvalidFormat;
 
-    const v0_data = try parseVertexDescriptor(vert1);
-    const v1_data = try parseVertexDescriptor(vert2);
-    const v2_data = try parseVertexDescriptor(vert3);
+    const v0_data = try parseVertexDescriptor(vert1, vertices_so_far, normals_so_far);
+    const v1_data = try parseVertexDescriptor(vert2, vertices_so_far, normals_so_far);
+    const v2_data = try parseVertexDescriptor(vert3, vertices_so_far, normals_so_far);
 
     try faces.append(allocator, Face{
         .v0 = v0_data.v,
@@ -1757,7 +1765,7 @@ fn parseFace(faces: *std.ArrayList(Face), line: []const u8, allocator: std.mem.A
     // Triangulate if more than 3 vertices (simple fan from v0)
     var prev = v2_data;
     while (iter.next()) |vert| {
-        const curr = try parseVertexDescriptor(vert);
+        const curr = try parseVertexDescriptor(vert, vertices_so_far, normals_so_far);
         try faces.append(allocator, Face{
             .v0 = v0_data.v,
             .v1 = prev.v,
@@ -1770,14 +1778,34 @@ fn parseFace(faces: *std.ArrayList(Face), line: []const u8, allocator: std.mem.A
     }
 }
 
-fn parseVertexDescriptor(desc: []const u8) !VertexDescriptor {
+/// Resolve one OBJ index against how many elements have been defined so far.
+///
+/// OBJ counts from 1, and also allows counting back from the end: -1 is the
+/// most recently defined element. That makes such an index meaningful only at
+/// the point in the file where it appears, which is why the count has to come
+/// in here rather than being checked later against the totals.
+fn resolveOBJIndex(index: i32, defined_so_far: usize) !u32 {
+    if (index > 0) {
+        // Absolute, so it is validated later against the final counts, once
+        // the whole file has been read.
+        return @intCast(index - 1);
+    }
+
+    if (index == 0) return error.InvalidIndex; // there is no element zero
+
+    const from_end = @as(i64, @intCast(defined_so_far)) + index;
+    if (from_end < 0) return error.InvalidIndex; // reaches back before the start
+
+    return @intCast(from_end);
+}
+
+fn parseVertexDescriptor(desc: []const u8, vertices_so_far: usize, normals_so_far: usize) !VertexDescriptor {
     // Format: "v/vt/vn" or "v//vn" or "v"
     var iter = std.mem.splitScalar(u8, desc, '/');
 
-    // Vertex index (required, OBJ uses 1-based indexing)
+    // Vertex index (required; OBJ counts from 1, or back from the end)
     const v_str = iter.next() orelse return error.InvalidFormat;
-    const v_index = try std.fmt.parseInt(i32, v_str, 10);
-    if (v_index <= 0) return error.InvalidIndex;
+    const v_index = try resolveOBJIndex(try std.fmt.parseInt(i32, v_str, 10), vertices_so_far);
 
     // Texture coord (optional, skip)
     _ = iter.next();
@@ -1786,14 +1814,12 @@ fn parseVertexDescriptor(desc: []const u8) !VertexDescriptor {
     var n_index: u32 = 0xFFFFFFFF; // sentinel for "not present"
     if (iter.next()) |n_str| {
         if (n_str.len > 0) {
-            const n = try std.fmt.parseInt(i32, n_str, 10);
-            if (n <= 0) return error.InvalidIndex;
-            n_index = @intCast(n - 1); // Convert to 0-based
+            n_index = try resolveOBJIndex(try std.fmt.parseInt(i32, n_str, 10), normals_so_far);
         }
     }
 
     return VertexDescriptor{
-        .v = @intCast(v_index - 1), // Convert to 0-based
+        .v = v_index,
         .n = n_index,
     };
 }
@@ -3878,20 +3904,17 @@ test "obj vertices may carry a fourth component, which is ignored" {
 test "obj input the parser cannot honour is rejected rather than guessed at" {
     const allocator = std.testing.allocator;
 
-    // Negative indices are legal OBJ, meaning "count back from the end", and
-    // this parser does not implement them. Rejecting is right; quietly reading
-    // them as positive would place the triangle somewhere else entirely.
-    try std.testing.expectError(error.InvalidIndex, parseOBJText(allocator,
-        \\v 0 0 0
-        \\v 1 0 0
-        \\v 0 1 0
-        \\f -3 -2 -1
-    ));
-
     // Index 0 does not exist in a format that counts from 1.
     try std.testing.expectError(error.InvalidIndex, parseOBJText(allocator,
         \\v 0 0 0
         \\f 0 0 0
+    ));
+
+    // A negative index that reaches back past the first vertex.
+    try std.testing.expectError(error.InvalidIndex, parseOBJText(allocator,
+        \\v 0 0 0
+        \\v 1 0 0
+        \\f -1 -2 -3
     ));
 
     // A face needs three corners.
@@ -3910,6 +3933,70 @@ test "obj input the parser cannot honour is rejected rather than guessed at" {
     try std.testing.expectError(error.InvalidCharacter, parseOBJText(allocator,
         \\v 1 2 three
     ));
+}
+
+test "obj negative indices count back from the vertices seen so far" {
+    const allocator = std.testing.allocator;
+
+    {
+        // -1 is the most recent vertex, -3 the one two before it.
+        const data = try parseOBJText(allocator,
+            \\v 0 0 0
+            \\v 1 0 0
+            \\v 0 1 0
+            \\f -3 -2 -1
+        );
+        defer data.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), data.faces.len);
+        try std.testing.expectEqual(@as(u32, 0), data.faces[0].v0);
+        try std.testing.expectEqual(@as(u32, 1), data.faces[0].v1);
+        try std.testing.expectEqual(@as(u32, 2), data.faces[0].v2);
+    }
+
+    {
+        // "So far" is the point in the file, not the end of it: the same face
+        // line means different vertices after more have been defined. This is
+        // the whole reason the count is threaded through the parser.
+        const data = try parseOBJText(allocator,
+            \\v 0 0 0
+            \\v 1 0 0
+            \\v 0 1 0
+            \\f -3 -2 -1
+            \\v 10 0 0
+            \\v 11 0 0
+            \\v 10 1 0
+            \\f -3 -2 -1
+        );
+        defer data.deinit();
+
+        try std.testing.expectEqual(@as(usize, 2), data.faces.len);
+        try std.testing.expectEqual(@as(u32, 0), data.faces[0].v0);
+        try std.testing.expectEqual(@as(u32, 3), data.faces[1].v0);
+        try std.testing.expectEqual(@as(u32, 5), data.faces[1].v2);
+    }
+
+    {
+        // Mixed with absolute indices, and negative normals resolving against
+        // their own count rather than the vertex one.
+        const data = try parseOBJText(allocator,
+            \\v 0 0 0
+            \\v 1 0 0
+            \\v 0 1 0
+            \\vn 0 0 1
+            \\vn 0 1 0
+            \\f 1//-2 -2//-1 -1//1
+        );
+        defer data.deinit();
+
+        const face = data.faces[0];
+        try std.testing.expectEqual(@as(u32, 0), face.v0);
+        try std.testing.expectEqual(@as(u32, 1), face.v1);
+        try std.testing.expectEqual(@as(u32, 2), face.v2);
+        try std.testing.expectEqual(@as(u32, 0), face.n0);
+        try std.testing.expectEqual(@as(u32, 1), face.n1);
+        try std.testing.expectEqual(@as(u32, 0), face.n2);
+    }
 }
 
 test "an obj with no faces yields an empty mesh rather than an error" {
