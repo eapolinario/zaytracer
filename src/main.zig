@@ -1503,32 +1503,19 @@ fn tracePhoton(
             // Absorbed. Storing it would paint a caustic onto the lamp itself,
             // and the light's own emission already accounts for this energy.
         },
-        .metal => {
-            // Reflect and continue (specular bounce for caustics)
-            const reflected = reflect(unitVector(ray.direction), rec.normal);
-            const scattered = Ray.init(rec.point, add(reflected, mul(randomInUnitSphere(rng), rec.material.fuzz)));
-
-            if (dot(scattered.direction, rec.normal) > 0) {
-                const new_power = mulVec(power, rec.material.albedo);
+        .metal, .dielectric => {
+            // Use the same scattering implementation as camera paths. In
+            // particular, a smooth-shaded dielectric can disagree with its
+            // triangle about which side it faces; Material.scatter falls back
+            // to the geometric normal in that case. Duplicating the old
+            // refraction code here made caustic photons take a different path
+            // from camera rays at exactly those silhouette hits.
+            var attenuation: Color = undefined;
+            var scattered: Ray = undefined;
+            if (rec.material.scatter(ray, rec, &attenuation, &scattered, rng)) {
+                const new_power = mulVec(power, attenuation);
                 tracePhoton(scattered, world, depth - 1, new_power, specular_bounces + 1, photons, photon_count, max_photons, rng);
             }
-        },
-        .dielectric => {
-            // Refract/reflect and continue (specular bounce for caustics)
-            const ri = if (rec.front_face) (1.0 / rec.material.refraction_index) else rec.material.refraction_index;
-            const unit_direction = unitVector(ray.direction);
-            const cos_theta = @min(dot(neg(unit_direction), rec.normal), 1.0);
-            const sin_theta = @sqrt(1.0 - cos_theta * cos_theta);
-
-            const cannot_refract = ri * sin_theta > 1.0;
-            const direction = if (cannot_refract or reflectance(cos_theta, ri) > randomFloat(rng))
-                reflect(unit_direction, rec.normal)
-            else
-                refract(unit_direction, rec.normal, ri);
-
-            const scattered = Ray.init(rec.point, direction);
-            // Dielectrics don't absorb light (for caustics)
-            tracePhoton(scattered, world, depth - 1, power, specular_bounces + 1, photons, photon_count, max_photons, rng);
         },
     }
 }
@@ -3822,13 +3809,14 @@ const StudioOptions = struct {
     /// dragon's flank:
     ///
     ///   panel_scale  emission   noise   relative deviation
-    ///   0.55         26.0       25.7    5.88   (default: hard light)
+    ///   0.55         26.0       25.7    5.88   (studio default: hard light)
     ///   0.85         10.9       21.4    --
-    ///   1.10          6.5       19.5    2.86   (soft light)
+    ///   1.10          6.5       19.5    2.86   (glass-dragon: soft light)
     ///
-    /// The default keeps the hard light, because the crisp shadow and the
-    /// tightly focused caustic are what these scenes exist to show. Soften it
-    /// when a clean glass surface matters more than a sharp shadow.
+    /// The studio helper keeps the hard-light defaults because crisp shadows
+    /// suit the smaller bunny. The 250k-triangle dragon opts into the soft
+    /// setup below; its extra specular paths amplify the variance more than
+    /// they benefit from the sharper shadow.
     emission: Color = Color{ 26.0, 25.0, 24.0 },
     /// Width of the panel as a fraction of the model's longest side.
     panel_scale: f64 = 0.55,
@@ -3926,6 +3914,12 @@ fn buildGlassDragonScene(allocator: std.mem.Allocator, io: std.Io) !SceneData {
     return buildStudioScene(allocator, io, dragon_model_path, Material.dielectric(1.5), .{
         .rotate_y = 140.0,
         .size = 6.0,
+        // The dragon takes a lot of low-probability paths through thick glass.
+        // A twice-as-wide panel at one quarter radiance keeps light power and
+        // exposure unchanged while making those paths four times more likely
+        // to find the emitter.
+        .panel_scale = 1.10,
+        .emission = Color{ 6.5, 6.25, 6.0 },
         // Glass over a large floor sends a lot of photons a long way, and a
         // closed budget would stop the emission early and dim the caustic.
         .photons = .{ .emitted = 2_000_000, .capacity = 700_000 },
@@ -4675,6 +4669,48 @@ test "photon map only stores photons that arrived via a specular bounce" {
     for (photons[0..caustic_count]) |photon| {
         try std.testing.expectEqual(power, photon.power);
     }
+}
+
+test "photon tracing uses the geometric side of a smooth dielectric" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+
+    const tilted = unitVector(Vec3{ 0.8, -0.6, 0 });
+    var primitives = [_]Primitive{
+        Primitive{ .triangle = Triangle.init(
+            Point3{ -10, 0, -10 },
+            Point3{ -10, 0, 10 },
+            Point3{ 10, 0, -10 },
+            Material.lambertian(Color{ 1, 1, 1 }),
+        ) },
+        Primitive{ .triangle = Triangle.initWithNormals(
+            Point3{ -1, 1, -1 },
+            Point3{ -1, 1, 1 },
+            Point3{ 1, 1, -1 },
+            tilted,
+            tilted,
+            tilted,
+            Material.dielectric(1.5),
+        ) },
+    };
+    const world = try BVH.init(allocator, &primitives);
+    defer world.deinit();
+
+    const ray = Ray.init(Point3{ -0.4, 2, -0.4 }, Vec3{ 0, -1, 0 });
+    var photons: [64]Photon = undefined;
+    var photon_count: usize = 0;
+
+    // The shading normal points the wrong way, but the triangle's own normal
+    // points up. A correctly entering photon is overwhelmingly transmitted
+    // and should reach the diffuse floor. The old photon-only refraction code
+    // treated it as exiting, forced total internal reflection, and stored none.
+    for (0..photons.len) |_| {
+        tracePhoton(ray, world, photon_max_bounces, Color{ 1, 1, 1 }, 0, &photons, &photon_count, photons.len, rng);
+        if (photon_count > 0) break;
+    }
+
+    try std.testing.expect(photon_count > 0);
 }
 
 test "radiance estimate applies the lambertian brdf" {

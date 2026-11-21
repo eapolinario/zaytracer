@@ -312,12 +312,12 @@ bent by Fresnel choices at every boundary, and after a few of them its exit
 direction is essentially random. It finds the panel only by chance, and when it
 does it brings back the panel's full radiance.
 
-On `glass-dragon` the panel's radiance is 26 against a floor near 0.5, so a
-pixel on the dragon is a lottery between roughly 0.03, 0.5 and 26. Measured
-over 512 samples on the flank: mean 0.33, peak 25.1, relative deviation 5.88 —
-and the variance attributable to those rare panel hits accounts for essentially
-all of it. Reaching a 5% error per pixel from a relative deviation of 5.88
-needs on the order of 14,000 samples.
+With the original hard-light setup, the panel radiance is 26 against a floor
+near 0.5, so a pixel on `glass-dragon` is a lottery between roughly 0.03, 0.5
+and 26. Measured over 512 samples on the flank: mean 0.33, peak 25.1, relative
+deviation 5.88 — and the variance attributable to those rare panel hits
+accounts for essentially all of it. Reaching a 5% error per pixel from a
+relative deviation of 5.88 needs on the order of 14,000 samples.
 
 So there are three levers, and only the first two are free of bias:
 
@@ -326,9 +326,14 @@ So there are three levers, and only the first two are free of bias:
    variance. `StudioOptions.panel_scale` and `.emission` do this, and the
    measured trade is tabulated beside them in `src/main.zig`. Going from
    `0.55`/`26.0` to `1.10`/`6.5` takes the flank from 25.7 to 19.5 and the
-   relative deviation from 5.88 to 2.86. The default keeps the hard light,
-   because the crisp shadow and tight caustic are what the scene is for.
+   relative deviation from 5.88 to 2.86. The shared studio helper still
+   defaults to the hard light, for the smaller bunny's crisper shadow, but the
+   `glass-dragon` scene uses the `1.10`/`6.5` setup. In a 600×337 A/B at 128
+   samples, that cut neighbour noise on the dragon body from 25.3 to 18.1
+   while changing its mean by about 0.5%.
 2. **More samples.** Noise falls as the square root, so this is slow but exact.
+   Doubling the softened dragon from 128 to 256 samples reduced whole-image
+   neighbour noise by another 16%, while leaving its mean essentially fixed.
 3. **Clamping** the brightest samples, which is what production renderers do,
    at the cost of quietly losing the energy it discards. Not implemented here.
 
