@@ -226,6 +226,122 @@ Rendering and viewing are deliberately separate: the raytracer only ever writes
 a `.ppm`, and `png`/`view` only act on a `.ppm` that already exists. Conversion
 is a normal make rule, so re-viewing an unchanged render does not reconvert it.
 
+## Diagnostics
+
+Rendering bugs rarely announce themselves. A dielectric that has gone wrong
+looks like a dielectric that is merely under-sampled, and both look like a
+model that was exported badly. `--debug` and `--probe` exist to tell those
+apart without changing the renderer to ask.
+
+`--debug=<view>` renders a false-colour image in place of the photograph. The
+views are traced by the ordinary renderer with a recorder attached, not by a
+separate simplified one, so what they report is what the render did.
+
+```sh
+./zig-out/bin/zaytracer --scene=glass-dragon --debug=variance
+./zig-out/bin/zaytracer --list-debug-views
+```
+
+| View | Question it answers |
+| --- | --- |
+| `normals` | What is the shading normal of the first surface seen? |
+| `geometric-normals` | What normal does that triangle actually have? |
+| `normal-flip` | Where do the two disagree about which side a ray arrived on? Red is glass, where it inverts the index of refraction. |
+| `bounces` | How long are the paths? Black through blue to red. |
+| `termination` | How do paths end? Red hit the depth ceiling, green was Russian roulette, blue left the scene. |
+| `material` | What is the camera actually looking at? Glass blue, metal yellow, matte grey, emitters white. |
+| `variance` | Where do a pixel's samples disagree with each other? This is where speckle is. |
+| `firefly` | Where is one rare bright sample carrying a whole pixel? |
+
+`variance` is usually the one to reach for first: speckle *is* sample
+disagreement, so it separates a noisy estimator from a surface that is
+genuinely detailed. `material` settles arguments about geometry — a shape that
+looks like the wrong material is often the right one, shaded oddly.
+
+Debug views are written without gamma, because they are measurements rather
+than pictures.
+
+`--probe=<x>,<y>` stops before rendering and prints the paths through a single
+pixel: every surface each one touched, whether glass transmitted or reflected,
+how far the shading normal had been bent from the surface, and how the path
+ended. Paths far brighter than the pixel's running mean are flagged and printed
+however late they occur, since finding a firefly is usually the point.
+
+```sh
+zig build run -Doptimize=ReleaseFast -Dwidth=600 -Dsamples=512 -- \
+  --scene=glass-dragon --probe=320,165
+```
+
+```
+sample 419: L=   25.140  bounces= 10  absorbed   *** FIREFLY ***
+    [ 0] dielectric    t=  0.9883 refracted entering=true  n.ng= 0.993
+    [ 1] dielectric    t=  1.4053 reflected entering=false n.ng= 1.000
+    ...
+mean L=0.3263  max L=25.1404  peak/mean=77.0x  relative deviation=5.88
+  samples more than 10x the running mean: 3/512
+  ended by roulette: 97/512 (0 of them returning pure black)
+  ended by hitting the depth ceiling: 0/512
+  samples with a normal flip on glass: 10/512
+```
+
+`n.ng` is the cosine between the shading normal and the triangle's own normal:
+`1.000` is a flat-shaded hit, and anything much below it means light is being
+bent about a normal the surface does not have. The sample count comes from
+`-Dsamples`; full traces stop after the first twelve so the output stays
+readable.
+
+The termination tallies are worth reading closely. A path ended by roulette
+brings back only what the surface it died on contributed locally, and a
+specular surface contributes nothing — so a roulette kill on glass is a black
+sample, and `returning pure black` counts them. If that number is not zero,
+the roulette is manufacturing salt-and-pepper noise rather than saving time.
+
+`tools/ppm_inspect.py` measures the resulting images — crops regions, converts
+to PNG, and reports neighbour-to-neighbour noise, which puts a number on how
+speckled a region is. See `tools/README.md`.
+
+### Why glass is noisy when the floor is not
+
+Speckle on a glass model, next to a floor that is perfectly smooth, is the
+usual outcome here and is worth understanding before treating it as a bug.
+
+Both surfaces are lit by the same panel. The floor is diffuse, so it *samples
+the panel directly*: every sample gets the same answer, and the floor converges
+almost immediately. Glass cannot be sampled that way — a path through it is
+bent by Fresnel choices at every boundary, and after a few of them its exit
+direction is essentially random. It finds the panel only by chance, and when it
+does it brings back the panel's full radiance.
+
+With the original hard-light setup, the panel radiance is 26 against a floor
+near 0.5, so a pixel on `glass-dragon` is a lottery between roughly 0.03, 0.5
+and 26. Measured over 512 samples on the flank: mean 0.33, peak 25.1, relative
+deviation 5.88 — and the variance attributable to those rare panel hits
+accounts for essentially all of it. Reaching a 5% error per pixel from a
+relative deviation of 5.88 needs on the order of 14,000 samples.
+
+So there are three levers, and only the first two are free of bias:
+
+1. **Soften the light.** Widening the panel and dimming it by the square keeps
+   the power, the exposure and the caustic's position while cutting the
+   variance. `StudioOptions.panel_scale` and `.emission` do this, and the
+   measured trade is tabulated beside them in `src/main.zig`. Going from
+   `0.55`/`26.0` to `1.10`/`6.5` takes the flank from 25.7 to 19.5 and the
+   relative deviation from 5.88 to 2.86. The shared studio helper still
+   defaults to the hard light, for the smaller bunny's crisper shadow, but the
+   `glass-dragon` scene uses the `1.10`/`6.5` setup. In a 600×337 A/B at 128
+   samples, that cut neighbour noise on the dragon body from 25.3 to 18.1
+   while changing its mean by about 0.5%.
+2. **More samples.** Noise falls as the square root, so this is slow but exact.
+   Doubling the softened dragon from 128 to 256 samples reduced whole-image
+   neighbour noise by another 16%, while leaving its mean essentially fixed.
+3. **Clamping** the brightest samples, which is what production renderers do,
+   at the cost of quietly losing the energy it discards. Not implemented here.
+
+What is *not* a cause, having been measured and ruled out on this scene:
+the mesh is watertight and consistently wound; the shading normals are smooth
+(`--debug=normals`) rather than aliasing; the smallest triangle is still 2.5x
+the ray epsilon after the model is fitted; and no path reaches `max_depth`.
+
 ## Implementation Notes
 
 - Uses full Zig idioms (error handling, tagged unions, comptime)
@@ -254,9 +370,14 @@ escape: the closed Cornell box renders in half the time, and a converged render
 of it agrees with the old one to within 0.2% in every region, which is the
 difference between an unbiased shortcut and simply rendering less.
 
-The depth limit remains as a ceiling, since a ray inside glass can keep
-reflecting internally, and roulette caps the survival probability below 1 so
-that even a path losing nothing has a way out.
+The depth limit remains as a ceiling, and it is what stops a path that never
+loses any energy: the survival probability is the throughput itself and is
+never capped below 1, so a ray reflecting around inside glass is not killed at
+random. Capping it used to end about a quarter of the paths through the glass
+dragon, and because a specular surface contributes nothing locally, every one
+of those came back black — salt-and-pepper noise generated by the very
+mechanism meant to save time. Paths that have genuinely gone dim are still
+ended, which is the whole point of roulette.
 
 Emission is counted only while a path has been specular the whole way from the
 camera: looking at the lamp, at its reflection, or at it through glass. Once a
